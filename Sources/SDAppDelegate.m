@@ -108,6 +108,7 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     BOOL     _rebuilding;
     BOOL     _restoring;          // 正在按上次记录自动应用
     BOOL     _restoreAttempted;   // 本次启动已开始过自动应用
+    NSInteger _restoreRetries;    // 显示器尚未枚举时的重试次数
     NSString *_restoreFailure;    // 自动应用失败的原因，显示在状态行
 
     SDDisplayDDC *_ddc;
@@ -128,7 +129,10 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     _ddc = [[SDDisplayDDC alloc] init];
 
     _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    _statusItem.button.title = @"HiDPI";
+    _statusItem.button.image = [self statusBarIconActive:NO];
+    _statusItem.button.imagePosition = NSImageOnly;
+    _statusItem.button.imageScaling = NSImageScaleNone;
+    _statusItem.button.toolTip = @"Simple Display";
 
     CGDisplayRegisterReconfigurationCallback(SDReconfigCallback, (__bridge void *)self);
     atexit(SDRestoreAtExit);
@@ -235,7 +239,18 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
     double h = [u doubleForKey:kSDLastHeight];
     double hz = [u doubleForKey:kSDLastHz];
     if (!key || w < 320 || h < 200) return;
-    if (!_info) return;
+    if (!_info) {
+        // 显示器枚举可能晚于进程启动完成，重试三次后放弃，避免反复建屏。
+        if (_restoreRetries < 3) {
+            _restoreRetries++;
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf restoreLastConfiguration];
+            });
+        }
+        return;
+    }
     // 目标屏尚未枚举（开机时外接屏可能晚于进程启动）时直接返回，
     // 由显示器接入回调再次触发。
     if (![key isEqualToString:[SDProbeCache displayKeyForDisplay:_info.displayID]]) return;
@@ -464,11 +479,41 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
             _screen.refreshRate];
 }
 
-- (NSString *)statusBarTitle {
-    if (!_screen.active) return @"HiDPI";
-    return [NSString stringWithFormat:@"%u×%u",
-            (unsigned)_screen.pointSize.width,
-            (unsigned)_screen.pointSize.height];
+/// 菜单栏图标：显示器轮廓；启用时轮廓内出现 2×2 像素块。
+/// 以 template image 提供，由系统按菜单栏明暗着色。
+- (NSImage *)statusBarIconActive:(BOOL)active {
+    NSImage *icon = [NSImage imageWithSize:NSMakeSize(18, 18)
+                                   flipped:NO
+                            drawingHandler:^BOOL(NSRect rect) {
+        [[NSColor blackColor] set];
+
+        NSBezierPath *frame = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1.3, 4.9, 15.4, 10.0)
+                                                             xRadius:2.2
+                                                             yRadius:2.2];
+        frame.lineWidth = 1.3;
+        [frame stroke];
+
+        if (active) {
+            for (NSInteger row = 0; row < 2; row++) {
+                for (NSInteger col = 0; col < 2; col++) {
+                    NSRect cell = NSMakeRect(5.9 + col * 4.2, 6.8 + row * 4.2, 2.0, 2.0);
+                    [[NSBezierPath bezierPathWithRoundedRect:cell xRadius:0.6 yRadius:0.6] fill];
+                }
+            }
+        }
+
+        NSBezierPath *stand = [NSBezierPath bezierPath];
+        [stand moveToPoint:NSMakePoint(9, 4.9)];
+        [stand lineToPoint:NSMakePoint(9, 3.1)];
+        [stand moveToPoint:NSMakePoint(6.3, 2.4)];
+        [stand lineToPoint:NSMakePoint(11.7, 2.4)];
+        stand.lineWidth = 1.3;
+        stand.lineCapStyle = NSLineCapStyleRound;
+        [stand stroke];
+        return YES;
+    }];
+    icon.template = YES;
+    return icon;
 }
 
 /// 音量行：标题 + 滑块 + 数值。菜单项用自定义视图承载，拖动即时生效。
@@ -664,7 +709,7 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
     [menu addItem:quit];
 
     _statusItem.menu = menu;
-    _statusItem.button.title = [self statusBarTitle];
+    _statusItem.button.image = [self statusBarIconActive:_screen.active];
 }
 
 #pragma mark - 菜单代理
@@ -768,7 +813,11 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
     // 触发一次 DDC 读取，确保音量值已就绪
     [_ddc reloadVolume:NULL];
     [self rebuildMenu];
-    printf("STATUSBAR: %s\n", _statusItem.button.title.UTF8String);
+    printf("STATUSBAR: icon=%.0fx%.0f position=%ld title=\"%s\"\n",
+           _statusItem.button.image.size.width,
+           _statusItem.button.image.size.height,
+           (long)_statusItem.button.imagePosition,
+           _statusItem.button.title.UTF8String);
     [self dumpMenu:_statusItem.menu depth:0];
 }
 

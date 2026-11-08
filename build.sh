@@ -15,6 +15,7 @@ clang -fobjc-arc -O2 -Wall \
     "$DIR"/Sources/*.m
 
 cp "$DIR/Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$DIR/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
 
 echo "built: $APP"

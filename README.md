@@ -4,7 +4,7 @@
 
 macOS HiDPI工具。为外接显示器创建一块 2× 渲染的虚拟屏，再把该显示器硬件镜像上去，使 macOS 可获得面板原生分辨率之外的 HiDPI 尺寸；同时可通过 DDC/CI 控制显示器音量。
 
-运行后菜单栏出现 `HiDPI` 条目。
+运行后菜单栏出现显示器图标：未启用时为空心轮廓，启用后轮廓内出现 2×2 像素块。
 
 本项目由Deepseek-V4.1-Flash编写，只在3440x1440显示器上验证，未对其他显示器适配。
 
@@ -156,6 +156,9 @@ simple-display/
 │   ├── SDVirtualScreen.h/.m       虚拟屏生命周期：建屏 / 自检 / 镜像 / 还原
 │   ├── SDProbeCache.h/.m          可用尺寸记录
 │   └── CGVirtualDisplayPrivate.h  私有 API 声明
-├── Resources/Info.plist           LSUIElement（无 Dock 图标）
+├── Resources/
+│   ├── Info.plist                 LSUIElement（无 Dock 图标）
+│   ├── AppIcon.icns               应用图标
+│   └── AppIcon-1024.png           图标母版
 └── build.sh
 ```

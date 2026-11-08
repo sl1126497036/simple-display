@@ -4,7 +4,7 @@
 
 A macOS menu bar utility for HiDPI. It creates a 2× virtual display for an external monitor, then hardware-mirrors that monitor onto it, so macOS can offer HiDPI sizes beyond the panel's native resolution. Monitor volume is controlled over DDC/CI.
 
-After launch, a `HiDPI` item appears in the menu bar.
+After launch, a monitor icon appears in the menu bar: an empty outline while off, and a 2×2 pixel grid inside the outline once on.
 
 This project was written by DeepSeek-V4.1-Flash and verified only on a 3440×1440 display. Other displays have not been tested.
 
@@ -156,6 +156,9 @@ simple-display/
 │   ├── SDVirtualScreen.h/.m        virtual display lifecycle: create / self-check / mirror / restore
 │   ├── SDProbeCache.h/.m           supported size record
 │   └── CGVirtualDisplayPrivate.h   private API declarations
-├── Resources/Info.plist            LSUIElement (no Dock icon)
+├── Resources/
+│   ├── Info.plist                 LSUIElement (no Dock icon)
+│   ├── AppIcon.icns               application icon
+│   └── AppIcon-1024.png           icon master
 └── build.sh
 ```
