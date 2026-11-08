@@ -7,6 +7,8 @@
 //    BetterLiteVD --apply W H [Hz] [ID]  启动即对某块屏应用（ID 缺省为主屏）
 //    BetterLiteVD --selftest             执行建屏/拆除/重建自检
 //    BetterLiteVD --diagnose             打印环境报告（提 issue 用）
+//    BetterLiteVD --login on|off         开启/关闭开机启动
+//    BetterLiteVD --login-status         打印开机启动状态
 //    BetterLiteVD --probe <displayID>    内部用：打印 "<点宽> <背板宽>"
 //    BetterLiteVD --modes <displayID>    内部用：逐行打印 "<点宽> <点高> <像素宽> <像素高>"
 //
@@ -16,6 +18,8 @@
 #import "BLDisplayInfo.h"
 #import "BLVirtualScreen.h"
 #import "BLProbeCache.h"
+
+#import <ServiceManagement/ServiceManagement.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -212,6 +216,46 @@ int main(int argc, const char *argv[]) {
             }
             if (!noCache) [[BLProbeCache shared] flushSync];
             return 0;
+        }
+
+        if (argc >= 2 && strcmp(argv[1], "--login-status") == 0) {
+            if (@available(macOS 13.0, *)) {
+                const char *name = "unknown";
+                switch (SMAppService.mainAppService.status) {
+                    case SMAppServiceStatusNotRegistered:   name = "not-registered"; break;
+                    case SMAppServiceStatusEnabled:         name = "enabled"; break;
+                    case SMAppServiceStatusRequiresApproval:name = "requires-approval"; break;
+                    case SMAppServiceStatusNotFound:        name = "not-found"; break;
+                }
+                printf("%s\n", name);
+            } else {
+                printf("unsupported\n");
+            }
+            return 0;
+        }
+
+        if (argc >= 3 && strcmp(argv[1], "--login") == 0) {
+            if (@available(macOS 13.0, *)) {
+                SMAppService *service = SMAppService.mainAppService;
+                NSError *err = nil;
+                BOOL ok;
+                if (strcmp(argv[2], "on") == 0) {
+                    ok = [service registerAndReturnError:&err];
+                } else if (strcmp(argv[2], "off") == 0) {
+                    ok = [service unregisterAndReturnError:&err];
+                } else {
+                    printf("usage: --login on|off\n");
+                    return 2;
+                }
+                if (ok) {
+                    printf("ok\n");
+                    return 0;
+                }
+                printf("fail: %s\n", err.localizedDescription.UTF8String ?: "unknown");
+                return 1;
+            }
+            printf("unsupported\n");
+            return 1;
         }
 
         if (argc >= 2 && strcmp(argv[1], "--diagnose") == 0) {

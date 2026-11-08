@@ -50,6 +50,8 @@ xattr -d com.apple.quarantine "/Applications/BetterLite VD.app"
 全部关闭
 重新扫描显示器
 ────────────
+开机启动
+────────────
 退出
 ```
 
@@ -69,6 +71,14 @@ BIN="build/BetterLite VD.app/Contents/MacOS/BetterLiteVD"
 
 ```bash
 "$BIN" --selftest                 # 建屏 → 还原 → 换刷新率重建 → 还原
+```
+
+开机启动：
+
+```bash
+"$BIN" --login-status              # not-registered / enabled / requires-approval
+"$BIN" --login on                  # 注册为登录项
+"$BIN" --login off                 # 取消
 ```
 
 诊断：
@@ -118,6 +128,7 @@ BIN="build/BetterLite VD.app/Contents/MacOS/BetterLiteVD"
 - 镜像时 master 与 slave 不会自动同步刷新率，程序在建屏前将物理屏切换到目标刷新率，并在关闭时恢复原模式。
 - 硬件镜像的 slave 不独立驱动，`CGDisplayIsActive` 返回 0 属正常状态，实际输出以系统报告的 `Hardware Mirror` 为准。
 - 部分尺寸组合下画面可能出现轻微周期性闪烁。更换分辨率档位可规避，成因尚未定位。
+- 开机启动使用 `SMAppService`（macOS 13 及以上）。注册记录 app 当前所在路径，因此仅在 app 位于「应用程序」文件夹时可用；在其它位置点击会提示先安装。
 
 ## 故障排查
 

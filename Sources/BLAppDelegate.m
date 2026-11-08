@@ -7,6 +7,8 @@
 #import "BLVirtualScreen.h"
 #import "BLProbeCache.h"
 
+#import <ServiceManagement/ServiceManagement.h>
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -253,14 +255,75 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     [self rebuildMenu];
 }
 
-- (void)showError:(NSString *)msg {
-    if (gBLRequestSelfTest) { fprintf(stderr, "ALERT: %s\n", msg.UTF8String); return; }
+- (void)showAlert:(NSString *)title info:(NSString *)info {
+    if (gBLRequestSelfTest) {
+        fprintf(stderr, "ALERT: %s | %s\n", title.UTF8String, info.UTF8String);
+        return;
+    }
     NSAlert *a = [[NSAlert alloc] init];
-    a.messageText = @"无法应用这个组合";
-    a.informativeText = [NSString stringWithFormat:@"%@\n\n屏幕已被还原，换一个尺寸或刷新率再试。", msg];
+    a.messageText = title;
+    a.informativeText = info;
     a.alertStyle = NSAlertStyleWarning;
     [a addButtonWithTitle:@"好"];
     [a runModal];
+}
+
+- (void)showError:(NSString *)msg {
+    [self showAlert:@"无法应用这个组合"
+               info:[NSString stringWithFormat:@"%@\n\n屏幕已被还原，换一个尺寸或刷新率再试。", msg]];
+}
+
+#pragma mark - 开机启动
+
+- (BOOL)launchAtLoginSupported {
+    if (@available(macOS 13.0, *)) return YES;
+    return NO;
+}
+
+- (BOOL)launchAtLoginEnabled {
+    if (@available(macOS 13.0, *)) {
+        return SMAppService.mainAppService.status == SMAppServiceStatusEnabled;
+    }
+    return NO;
+}
+
+/// 登录项记录的是 app 当前所在路径。从 build/ 或临时目录注册，
+/// 该目录被清理后登录项会指向不存在的路径，因此只在应用程序目录内注册。
+- (BOOL)isInApplicationsFolder {
+    NSString *bundle = [NSBundle mainBundle].bundlePath;
+    NSString *userApps = [NSHomeDirectory() stringByAppendingPathComponent:@"Applications"];
+    return [bundle hasPrefix:@"/Applications/"] ||
+           [bundle hasPrefix:[userApps stringByAppendingString:@"/"]];
+}
+
+- (void)toggleLaunchAtLogin:(NSMenuItem *)item {
+    if (![self launchAtLoginSupported]) return;
+
+    if (![self isInApplicationsFolder]) {
+        [self showAlert:@"需要先安装"
+                   info:@"请将 app 移入「应用程序」文件夹后再开启开机启动。"];
+        return;
+    }
+
+    if (@available(macOS 13.0, *)) {
+        SMAppService *service = SMAppService.mainAppService;
+        NSError *err = nil;
+        BOOL ok;
+        if (service.status == SMAppServiceStatusEnabled) {
+            ok = [service unregisterAndReturnError:&err];
+        } else {
+            ok = [service registerAndReturnError:&err];
+        }
+
+        if (!ok) {
+            [self showAlert:@"无法修改登录项"
+                       info:err.localizedDescription ?: @"系统拒绝了该操作。"];
+        } else if (service.status == SMAppServiceStatusRequiresApproval) {
+            [self showAlert:@"需要批准"
+                       info:@"请在 系统设置 → 通用 → 登录项 中允许 BetterLite VD。"];
+        }
+        [self rebuildMenu];
+    }
 }
 
 #pragma mark - 菜单
@@ -337,6 +400,16 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSMenuItem *rescan = [[NSMenuItem alloc] initWithTitle:@"重新扫描显示器" action:@selector(rescanAction) keyEquivalent:@"r"];
     rescan.target = self;
     [menu addItem:rescan];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *login = [[NSMenuItem alloc] initWithTitle:@"开机启动"
+                                                   action:@selector(toggleLaunchAtLogin:)
+                                            keyEquivalent:@""];
+    login.target = self;
+    login.enabled = [self launchAtLoginSupported];
+    login.state = [self launchAtLoginEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:login];
 
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"退出" action:@selector(quitAction) keyEquivalent:@"q"];

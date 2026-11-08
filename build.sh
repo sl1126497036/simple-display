@@ -10,7 +10,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 clang -fobjc-arc -O2 -Wall \
-    -framework Cocoa -framework CoreGraphics \
+    -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
     -o "$APP/Contents/MacOS/$BIN" \
     "$DIR"/Sources/*.m
 
