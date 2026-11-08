@@ -31,7 +31,7 @@ static const char *SDExecutablePath(void) {
     return resolved;
 }
 
-/// fork + exec 自己，跑一个只读子命令并把 stdout 全收下来。
+/// fork + exec 本进程，执行只读子命令并收取全部 stdout。
 ///
 /// 读取真实模式的调用一律走子进程。创建虚拟屏的进程内，
 /// CGDisplayCopyAllDisplayModes / CGDisplayCopyDisplayMode 返回 NULL 或陈旧值，
@@ -83,7 +83,7 @@ static BOOL SDProbeCurrentMode(CGDirectDisplayID vid, size_t *pointW, size_t *pi
 #pragma mark - 物理屏模式对齐
 
 /// 在物理屏的模式表里找与目标刷新率最接近、且像素尺寸为面板原生的模式。
-/// 硬件镜像不会自己把 slave 的刷新率改成 master 的，必须先手动对齐，否则两边各扫各的。
+/// 硬件镜像不同步 slave 的刷新率，需先手动对齐，否则 master 与 slave 按不同频率刷新。
 ///
 /// 比对使用像素尺寸，原生像素由 SDDisplayInfo 推断。
 /// 以 CGDisplayPixelsWide 作为原生值会在两种情况下失配：
@@ -123,9 +123,8 @@ static CGDisplayModeRef SDCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
 
 /// 建一块虚拟屏并申请一组点尺寸（统一 hiDPI）。
 ///
-/// 像素上限按候选中的最大尺寸计算。
-/// 5K 屏点宽 5120 需要 10240 背板，6K 点宽 6016 需要 12032；
-/// 固定为 8192 会使这两类屏建屏失败。
+/// 像素上限按候选中的最大尺寸计算：5K 屏点宽 5120 需要 10240 背板，
+/// 6K 点宽 6016 需要 12032。
 static CGVirtualDisplay *SDMakeVirtualDisplay(CGDirectDisplayID physID,
                                               NSArray<NSValue *> *pointSizes,
                                               double hz,
@@ -149,7 +148,7 @@ static CGVirtualDisplay *SDMakeVirtualDisplay(CGDirectDisplayID physID,
 
     unsigned needW = (unsigned)MAX((double)maxPtW * 2.0 + 64.0, 1024.0);
     unsigned needH = (unsigned)MAX((double)maxPtH * 2.0 + 64.0, 768.0);
-    // 可用环境变量抬下限做对照实验（排查「降级是否与 maxPixels 相关」）
+    // 环境变量 SD_MIN_MAXPIXELS 可抬高 maxPixels 下限，用于核对降级与像素上限的关系
     const char *env = getenv("SD_MIN_MAXPIXELS");
     if (env) {
         unsigned floorPx = (unsigned)atoi(env);
@@ -160,7 +159,7 @@ static CGVirtualDisplay *SDMakeVirtualDisplay(CGDirectDisplayID physID,
     d.maxPixelsHigh = needH;
     d.sizeInMillimeters = CGDisplayScreenSize(physID);
     d.vendorID = kSDVendorID;             // 'SD'：标识本工具创建的屏
-    d.productID = physID;                 // 每块屏唯一，避免多屏时撞车
+    d.productID = physID;                 // 每块屏唯一，避免多屏时冲突
     d.serialNum = physID;
     d.queue = dispatch_get_main_queue();
 
@@ -281,7 +280,7 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
         usleep(120 * 1000);
     }
 
-    (void)vd;              // 出作用域即释放 → 销毁
+    (void)vd;              // 出作用域即释放，虚拟屏随之销毁
     usleep(200 * 1000);    // 留出销毁间隔，避免下次建屏处于过渡态
     return result;
 }
@@ -350,7 +349,7 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     CGDisplayModeRef aligned = SDCopyAlignedMode(_physicalDisplayID, hz);
     if (aligned) {
         double exact = CGDisplayModeGetRefreshRate(aligned);
-        if (exact > 1.0) hz = exact;      // 沿用面板的精确刷新率，避免 99.86 vs 100.00 的节拍差
+        if (exact > 1.0) hz = exact;      // 沿用面板的精确刷新率，避免 99.86 与 100.00 之间的累积偏差
         CGDisplayConfigRef cfg = NULL;
         if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
             CGError me = CGConfigureDisplayWithDisplayMode(cfg, _physicalDisplayID, aligned, NULL);
@@ -430,7 +429,7 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 
 - (void)teardown {
     if (_active) {
-        // 必须使用物理屏 ID：虚拟屏为主屏时 CGMainDisplayID() 返回虚拟屏，导致解镜对象错误
+        // 必须使用物理屏 ID：虚拟屏为主屏时 CGMainDisplayID() 返回虚拟屏，导致解除镜像的对象错误
         CGDisplayConfigRef cfg = NULL;
         if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
             CGConfigureDisplayMirrorOfDisplay(cfg, _physicalDisplayID, kCGNullDirectDisplay);

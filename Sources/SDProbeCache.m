@@ -41,6 +41,10 @@ static NSString *SDDisplayKey(CGDirectDisplayID did) {
             vendor, model, (size_t)llround(native.width), (size_t)llround(native.height)];
 }
 
++ (NSString *)displayKeyForDisplay:(CGDirectDisplayID)did {
+    return SDDisplayKey(did);
+}
+
 static NSString *SDSizeKey(CGSize size) {
     return [NSString stringWithFormat:@"%ux%u",
             (unsigned)llround(size.width), (unsigned)llround(size.height)];

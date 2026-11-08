@@ -2,3 +2,5 @@ build/
 *.app/
 .DS_Store
 *.xcuserstate
+.idea/
+.workbuddy/

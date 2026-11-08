@@ -153,8 +153,8 @@ static void SDPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
         if (!dict[key]) dict[key] = [NSValue valueWithSize:CGSizeMake(w, h)];
     };
 
-    // 1) 这块屏自己认可的点尺寸（含系统已提供的 HiDPI 变体）。
-    //    用点尺寸，因为虚拟屏的 CGVirtualDisplayMode 收的是点尺寸。
+    // 1) 该屏模式表提供的点尺寸（含系统已提供的 HiDPI 变体）。
+    //    用点尺寸：虚拟屏的 CGVirtualDisplayMode 接收点尺寸。
     NSDictionary *opts = @{ (__bridge NSString *)kSDShowDuplicateModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)opts);
     if (modes) {
@@ -166,7 +166,7 @@ static void SDPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
         CFRelease(modes);
     }
 
-    // 2) 按本屏原生像素等比生成档位，覆盖系统没列出来、但虚拟屏能建的尺寸。
+    // 2) 按本屏原生像素等比生成档位，补充系统模式表未列出、虚拟屏可创建的尺寸。
     static const double ratios[] = {1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.50};
     for (size_t i = 0; i < sizeof(ratios) / sizeof(ratios[0]); i++) {
         unsigned w = (unsigned)(llround((double)_pixelWidth * ratios[i] / 2.0) * 2.0);

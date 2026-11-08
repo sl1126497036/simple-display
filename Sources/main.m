@@ -1,16 +1,20 @@
 //
 //  main.m
-//  Simple Display — 用 CGVirtualDisplay 做真 2× HiDPI，并硬件镜像到物理屏。
+//  Simple Display：通过 CGVirtualDisplay 提供 2× 背板 HiDPI，并硬件镜像到物理屏。
 //
 //  用法：
 //    SimpleDisplay                        菜单栏常驻
 //    SimpleDisplay --apply W H [Hz] [ID]  启动即对某块屏应用（ID 缺省为主屏）
 //    SimpleDisplay --selftest             执行建屏/拆除/重建自检
-//    SimpleDisplay --diagnose             打印环境报告（提 issue 用）
-//    SimpleDisplay --volume [0-100]      读取或设置显示器音量\n//    SimpleDisplay --login on|off         开启/关闭开机启动
+//    SimpleDisplay --diagnose             打印环境报告，用于问题反馈
+//    SimpleDisplay --volume [0-100]       读取或设置显示器音量
+//    SimpleDisplay --login on|off         开启/关闭开机启动
 //    SimpleDisplay --login-status         打印开机启动状态
 //    SimpleDisplay --probe <displayID>    内部用：打印 "<点宽> <背板宽>"
 //    SimpleDisplay --modes <displayID>    内部用：逐行打印 "<点宽> <点高> <像素宽> <像素高>"
+//    SimpleDisplay --probe-size W H [ID]  内部用：单档检测，打印 2x / 1x / fail
+//    SimpleDisplay --probe-all <id>       内部用：逐档检测全部候选尺寸，结果写入缓存
+//    SimpleDisplay --dump-menu            内部用：打印菜单结构
 //
 
 #import <Cocoa/Cocoa.h>
@@ -104,7 +108,9 @@ static void SDReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
                 if (r == 1) [ok addObject:v]; else [bad addObject:v];
                 fprintf(stderr, "\r    %ux%u -> %s        ",
                         (unsigned)v.sizeValue.width, (unsigned)v.sizeValue.height,
-                        r == 1 ? "2x" : (r == 0 ? "1x (降级)" : "建屏失败"));
+                        r == 1 ? "2x"
+                               : (r == 0 ? "1x (降级)"
+                                         : "建屏失败"));
                 fflush(stderr);
             }
             fprintf(stderr, "\n");

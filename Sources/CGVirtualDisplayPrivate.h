@@ -1,6 +1,6 @@
 //
 //  CGVirtualDisplayPrivate.h
-//  私有 API 声明（CoreGraphics 未公开，但 macOS 13+ 一直可用）。
+//  私有 API 声明（CoreGraphics 未公开，macOS 13 起可用）。
 //  只声明用到的部分。
 //
 

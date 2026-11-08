@@ -19,7 +19,7 @@ extern BOOL gSDRequestDumpMenu;   // 定义在 main.m
 
 /// 在后台探测当前屏的全部候选尺寸。
 ///
-/// 走子进程而不是在本进程里建屏，有两个原因：
+/// 探测走子进程：
 ///  1. 建屏为同步调用，单档 1~2 秒，置于主线程会阻塞菜单；
 ///  2. 探测需反复建拆虚拟屏，置于子进程可隔离失败，不影响正在使用的屏。
 static void SDRunProbeAll(CGDirectDisplayID did,
@@ -94,6 +94,7 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 
 @interface SDAppDelegate ()
 - (void)rebuildMenu;
+- (void)restoreLastConfiguration;
 @end
 
 @implementation SDAppDelegate {
@@ -105,6 +106,9 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     double   _prefHz;
     BOOL     _probing;
     BOOL     _rebuilding;
+    BOOL     _restoring;          // 正在按上次记录自动应用
+    BOOL     _restoreAttempted;   // 本次启动已开始过自动应用
+    NSString *_restoreFailure;    // 自动应用失败的原因，显示在状态行
 
     SDDisplayDDC *_ddc;
     NSSlider    *_volumeSlider;
@@ -146,6 +150,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
         if (did == kCGNullDirectDisplay) did = CGMainDisplayID();
         double hz = self.startupHz > 1.0 ? self.startupHz : [self preferredHz];
         [self applyToDisplay:did size:self.startupSize refreshRate:hz];
+    } else if (!gSDRequestSelfTest && !gSDRequestDumpMenu) {
+        [self restoreLastConfiguration];
     }
 
     if (gSDRequestSelfTest) [self runSelfTest];
@@ -183,10 +189,69 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 
 static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlags flags, void *ctx) {
     SDAppDelegate *delegate = (__bridge SDAppDelegate *)ctx;
+    BOOL added = (flags & kCGDisplayAddFlag) != 0;
     if (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag | kCGDisplayEnabledFlag |
                  kCGDisplayDisabledFlag | kCGDisplayMovedFlag)) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [delegate rescan]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [delegate rescan];
+            // 目标屏晚于进程启动才枚举出时，在此补一次自动恢复。
+            if (added) [delegate restoreLastConfiguration];
+        });
     }
+}
+
+#pragma mark - 上次组合
+
+static NSString *const kSDLastDisplayKey = @"SDLastDisplayKey";
+static NSString *const kSDLastWidth      = @"SDLastPointWidth";
+static NSString *const kSDLastHeight     = @"SDLastPointHeight";
+static NSString *const kSDLastHz         = @"SDLastRefreshRate";
+
+/// 记录一组已生效的尺寸与刷新率，供下次启动恢复。
+/// 显示器身份一并记录：换屏后旧尺寸不再适用。
+- (void)rememberConfigurationForDisplay:(CGDirectDisplayID)physID size:(CGSize)size hz:(double)hz {
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    [u setObject:[SDProbeCache displayKeyForDisplay:physID] forKey:kSDLastDisplayKey];
+    [u setDouble:llround(size.width) forKey:kSDLastWidth];
+    [u setDouble:llround(size.height) forKey:kSDLastHeight];
+    [u setDouble:hz forKey:kSDLastHz];
+}
+
+- (void)forgetConfiguration {
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    [u removeObjectForKey:kSDLastDisplayKey];
+    [u removeObjectForKey:kSDLastWidth];
+    [u removeObjectForKey:kSDLastHeight];
+    [u removeObjectForKey:kSDLastHz];
+}
+
+/// 启动时重建上次成功的组合。
+/// 显示器枚举在启动阶段尚未稳定，延迟 1.2 秒再建屏。
+- (void)restoreLastConfiguration {
+    if (_restoreAttempted) return;
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    NSString *key = [u stringForKey:kSDLastDisplayKey];
+    double w = [u doubleForKey:kSDLastWidth];
+    double h = [u doubleForKey:kSDLastHeight];
+    double hz = [u doubleForKey:kSDLastHz];
+    if (!key || w < 320 || h < 200) return;
+    if (!_info) return;
+    // 目标屏尚未枚举（开机时外接屏可能晚于进程启动）时直接返回，
+    // 由显示器接入回调再次触发。
+    if (![key isEqualToString:[SDProbeCache displayKeyForDisplay:_info.displayID]]) return;
+    _restoreAttempted = YES;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) s = weakSelf;
+        if (!s || s->_screen.active || !s->_info) return;
+        s->_restoring = YES;
+        s->_restoreFailure = nil;
+        [s applyToDisplay:s->_info.displayID size:CGSizeMake(w, h) refreshRate:hz];
+        s->_restoring = NO;
+        [s rebuildMenu];
+    });
 }
 
 #pragma mark - 应用
@@ -212,22 +277,31 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSError *err = nil;
     if (![_screen applyPointSize:size refreshRate:hz error:&err]) {
         fprintf(stderr, "APPLY FAIL: %s\n", err.localizedDescription.UTF8String);
-        // code 4 = 没拿到 2× 背板。这是「这块屏 + 这个尺寸」的固有结论，
+        // code 4 = 未获得 2× 背板。该结论对「这块屏 + 这个尺寸」成立，
         // 记录后该尺寸不再列出。
         if (err.code == 4) {
             [[SDProbeCache shared] setResult:SDProbeResultDegraded forDisplay:physID size:size];
         }
-        [self showError:err.localizedDescription];
+        if (_restoring) {
+            // 自动恢复期间失败不弹窗。
+            _restoreFailure = @"上次的尺寸无法应用，请手动选择";
+            [self forgetConfiguration];
+        } else {
+            [self showError:err.localizedDescription];
+        }
     } else {
         fprintf(stderr, "APPLY OK: %ux%u @%.2fHz\n",
                 (unsigned)size.width, (unsigned)size.height, _screen.refreshRate);
         [[SDProbeCache shared] setResult:SDProbeResultHiDPI forDisplay:physID size:size];
+        [self rememberConfigurationForDisplay:physID size:size hz:_screen.refreshRate];
+        _restoreFailure = nil;
     }
     [self rescan];
 }
 
 - (void)turnOff {
     [_screen teardown];
+    _restoreFailure = nil;
     [self rescan];
 }
 
@@ -268,7 +342,7 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     [self rebuildMenu];
 }
 
-/// 连续拖动只写最后落点，避免 DDC 通道被写满。
+/// 连续拖动只保留最后落点写入，中间的拖动值不逐个下发。
 - (void)scheduleVolumeWrite:(unsigned)target {
     unsigned max = _ddc.maximum ? _ddc.maximum : 100;
     if (target > max) target = max;
@@ -337,8 +411,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     return NO;
 }
 
-/// 登录项记录的是 app 当前所在路径。从 build/ 或临时目录注册，
-/// 该目录被清理后登录项会指向不存在的路径，因此只在应用程序目录内注册。
+/// 登录项记录 app 当前所在路径，仅在应用程序目录内注册。
+/// 从 build/ 或临时目录注册时，该目录被清理后登录项指向不存在的路径。
 - (BOOL)isInApplicationsFolder {
     NSString *bundle = [NSBundle mainBundle].bundlePath;
     NSString *userApps = [NSHomeDirectory() stringByAppendingPathComponent:@"Applications"];
@@ -381,7 +455,9 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 - (NSString *)statusText {
     if (_probing) return @"正在检测可用尺寸…";
     if (!_info) return @"未检测到显示器";
-    if (!_screen.active) return @"未启用";
+    if (!_screen.active) {
+        return _restoreFailure ?: @"未启用";
+    }
     return [NSString stringWithFormat:@"%u × %u  @ %.0fHz",
             (unsigned)_screen.pointSize.width,
             (unsigned)_screen.pointSize.height,
@@ -395,14 +471,14 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
             (unsigned)_screen.pointSize.height];
 }
 
-/// 音量行：标题 + 滑块 + 数值。菜单项用自定义 view 承载，拖动即时生效。
+/// 音量行：标题 + 滑块 + 数值。菜单项用自定义视图承载，拖动即时生效。
 - (NSMenuItem *)volumeMenuItem {
     NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"音量" action:nil keyEquivalent:@""];
 
     CGFloat width = 250, height = 26;
     NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
 
-    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(14, 4, 44, 18)];
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(27, 4, 30, 18)];
     title.stringValue = @"音量";
     title.bezeled = NO;
     title.drawsBackground = NO;
@@ -540,7 +616,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     // 尺寸检测
     BOOL probed = [[SDProbeCache shared] hasAnyResultForDisplay:_info.displayID];
     NSString *probeTitle = _probing ? @"正在检测…"
-                                    : (probed ? @"重新检测尺寸" : @"检测可用尺寸");
+                                    : (probed ? @"重新检测尺寸"
+                                              : @"检测可用尺寸");
     NSMenuItem *probe = [[NSMenuItem alloc] initWithTitle:probeTitle
                                                    action:@selector(probeAction:)
                                             keyEquivalent:@""];
@@ -595,7 +672,7 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 - (void)menuWillOpen:(NSMenu *)menu {
     if (!_ddc.isAvailable) return;
 
-    // 读 DDC 约 100ms，放后台避免菜单卡住
+    // 读 DDC 约 100ms，置于后台，避免菜单阻塞
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSError *err = nil;
         BOOL ok = [self->_ddc reloadVolume:&err];
@@ -651,7 +728,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     [self rebuildMenu];
 }
 
-- (void)turnOffAction { [self turnOff]; }
+/// 关闭虚拟屏时一并清除自动恢复记录。
+- (void)turnOffAction { [self forgetConfiguration]; [self turnOff]; }
 - (void)quitAction { [self turnOff]; [NSApp terminate:nil]; }
 
 - (void)dumpMenuLine:(NSString *)text depth:(int)depth {
@@ -679,7 +757,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
         if (it.submenu && it.submenu.numberOfItems <= 24) {
             [self dumpMenu:it.submenu depth:depth + 1];
         } else if (it.submenu) {
-            [self dumpMenuLine:[NSString stringWithFormat:@"… %ld 项", (long)it.submenu.numberOfItems]
+            [self dumpMenuLine:[NSString stringWithFormat:@"… %ld 项",
+                                (long)it.submenu.numberOfItems]
                          depth:depth + 1];
         }
     }
@@ -702,7 +781,7 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 - (void)runSelfTest {
     gSDRequestSelfTest = YES;
 
-    if (!_info) { printf("FAIL: 没有发现显示器\n"); exit(1); }
+    if (!_info) { printf("FAIL: %s\n", "没有发现显示器"); exit(1); }
     printf("DISPLAY: %s  %zux%zu  %s\n", _info.name.UTF8String,
            _info.pixelWidth, _info.pixelHeight, _info.aspectLabel.UTF8String);
     printf("REFRESH: ");
@@ -732,7 +811,9 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     CGDisplayModeRef after = CGDisplayCopyDisplayMode(_info.displayID);
     if (after) { afterHz = CGDisplayModeGetRefreshRate(after); CGDisplayModeRelease(after); }
     printf("B teardown -> active=%d  physHz=%.2f (原 %.2f) %s\n",
-           _screen.active, afterHz, origHz, (fabs(afterHz - origHz) < 0.6 ? "还原OK" : "还原失败"));
+           _screen.active, afterHz, origHz,
+           fabs(afterHz - origHz) < 0.6 ? "还原OK"
+                                        : "还原失败");
     [self spin:2.0];
 
     // 用最低刷新率验证对齐与还原
@@ -750,7 +831,9 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     CGDisplayModeRef fin = CGDisplayCopyDisplayMode(_info.displayID);
     if (fin) { finHz = CGDisplayModeGetRefreshRate(fin); CGDisplayModeRelease(fin); }
     printf("D final -> active=%d  physHz=%.2f (原 %.2f) %s\n",
-           _screen.active, finHz, origHz, (fabs(finHz - origHz) < 0.6 ? "还原OK" : "还原失败"));
+           _screen.active, finHz, origHz,
+           fabs(finHz - origHz) < 0.6 ? "还原OK"
+                                      : "还原失败");
 
     printf("DDC: available=%d volume=%u/%u\n", _ddc.isAvailable, _ddc.volume, _ddc.maximum);
     [self spin:1.0];

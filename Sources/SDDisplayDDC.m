@@ -87,7 +87,7 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
 
 #pragma mark - DDC/CI 收发
 
-/// 读取一个 VCP。驱动负责补 0x80|长度 与校验字节，载荷只需操作码与参数。
+/// 读取一个 VCP。驱动负责补 0x80|长度 与校验字节，载荷仅含操作码与参数。
 - (BOOL)readVCP:(uint8_t)vcp current:(uint16_t *)current maximum:(uint16_t *)maximum {
     if (!_service) return NO;
 
@@ -96,7 +96,7 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
         return NO;
     }
 
-    // 显示器应答有延迟，读早会拿到空包
+    // 显示器应答有延迟，过早读取会得到空应答
     usleep(80 * 1000);
 
     uint8_t reply[11] = { 0 };
