@@ -126,12 +126,16 @@ static const double kBLAspectTolerance = 0.03;   // 3%
 - (void)buildRefreshRates {
     NSMutableArray<NSNumber *> *list = [NSMutableArray array];
 
+    // 只收「面板原生像素尺寸」下的刷新率。模式表里 50/56/67Hz 之类往往属于别的分辨率，
+    // 列出来会让用户选了个实际落不到的值。
     NSDictionary *opts = @{ (__bridge NSString *)kBLShowDuplicateModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)opts);
     if (modes) {
         CFIndex n = CFArrayGetCount(modes);
         for (CFIndex i = 0; i < n; i++) {
             CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            if (CGDisplayModeGetWidth(m) != _pixelWidth) continue;
+            if (CGDisplayModeGetHeight(m) != _pixelHeight) continue;
             double r = CGDisplayModeGetRefreshRate(m);
             if (r <= 1.0) continue;
             BOOL dup = NO;

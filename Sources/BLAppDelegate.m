@@ -382,21 +382,41 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     double hz = info.refreshRates.count ? info.refreshRates.lastObject.doubleValue : 60.0;
     CGSize def = info.defaultPointSize;
 
+    // 记录物理屏原始刷新率，用于验证还原
+    double origHz = 0;
+    CGDisplayModeRef orig = CGDisplayCopyDisplayMode(info.displayID);
+    if (orig) { origHz = CGDisplayModeGetRefreshRate(orig); CGDisplayModeRelease(orig); }
+
     [self applyToDisplay:info.displayID size:def refreshRate:hz];
     BLVirtualScreen *vs = _screens[@(info.displayID)];
-    printf("A apply %ux%u -> active=%d\n", (unsigned)def.width, (unsigned)def.height, vs.active);
+    printf("A apply %ux%u @%.0f -> active=%d\n", (unsigned)def.width, (unsigned)def.height, hz, vs.active);
     [self spin:3.0];
 
     [self turnOffDisplay:info.displayID];
-    printf("B teardown -> active=%d main=%u\n", vs.active, CGMainDisplayID());
-    [self spin:2.5];
+    usleep(600 * 1000);
+    double afterHz = 0;
+    CGDisplayModeRef after = CGDisplayCopyDisplayMode(info.displayID);
+    if (after) { afterHz = CGDisplayModeGetRefreshRate(after); CGDisplayModeRelease(after); }
+    printf("B teardown -> active=%d  physHz=%.2f (原 %.2f) %s\n",
+           vs.active, afterHz, origHz, (fabs(afterHz - origHz) < 0.6 ? "还原OK" : "还原失败"));
+    [self spin:2.0];
 
-    [self applyToDisplay:info.displayID size:def refreshRate:hz];
-    printf("C re-apply -> active=%d\n", vs.active);
+    // 用最低刷新率再测一次对齐 + 还原
+    double lowHz = info.refreshRates.count ? info.refreshRates.firstObject.doubleValue : 60.0;
+    [self applyToDisplay:info.displayID size:def refreshRate:lowHz];
+    double duringHz = 0;
+    CGDisplayModeRef during = CGDisplayCopyDisplayMode(info.displayID);
+    if (during) { duringHz = CGDisplayModeGetRefreshRate(during); CGDisplayModeRelease(during); }
+    printf("C apply %.0fHz -> active=%d  physHz=%.2f\n", lowHz, vs.active, duringHz);
     [self spin:2.5];
 
     [self turnOffAll];
-    printf("D final -> active=%d\n", vs.active);
+    usleep(600 * 1000);
+    double finHz = 0;
+    CGDisplayModeRef fin = CGDisplayCopyDisplayMode(info.displayID);
+    if (fin) { finHz = CGDisplayModeGetRefreshRate(fin); CGDisplayModeRelease(fin); }
+    printf("D final -> active=%d  physHz=%.2f (原 %.2f) %s\n",
+           vs.active, finHz, origHz, (fabs(finHz - origHz) < 0.6 ? "还原OK" : "还原失败"));
     [self spin:1.0];
     exit(0);
 }

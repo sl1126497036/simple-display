@@ -100,6 +100,7 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
     BOOL _active;
     CGSize _pointSize;
     double _refreshRate;
+    CGDisplayModeRef _savedPhysMode;   // 对齐刷新率前的物理屏模式，还原时恢复
 }
 
 - (instancetype)initWithPhysicalDisplay:(CGDirectDisplayID)did {
@@ -140,6 +141,11 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
         usleep(100 * 1000);
     }
     usleep(400 * 1000);
+
+    // 记下物理屏此刻的原生模式（首次应用时）。对齐刷新率会改它，还原时要换回来。
+    if (!_savedPhysMode) {
+        _savedPhysMode = CGDisplayCopyDisplayMode(_physicalDisplayID);
+    }
 
     // 先把物理屏切到与目标一致的刷新率。硬件镜像不会自动同步 slave 的刷新率，
     // 不对齐就会 master 100Hz / slave 60Hz 各扫各的，表现为画面周期性抖动。
@@ -271,12 +277,30 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
         _vd = nil;          // 释放即销毁虚拟屏
         _virtualDisplayID = 0;
     }
+
+    // 把物理屏刷新率换回对齐前的值，否则关掉虚拟屏后会停留在被改过的频率上
+    if (_savedPhysMode) {
+        usleep(200 * 1000);
+        CGDisplayConfigRef cfg = NULL;
+        if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
+            if (CGConfigureDisplayWithDisplayMode(cfg, _physicalDisplayID, _savedPhysMode, NULL) == kCGErrorSuccess) {
+                CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
+            } else {
+                CGCancelDisplayConfiguration(cfg);
+            }
+        }
+    }
+
     _pointSize = CGSizeZero;
     _refreshRate = 0;
 }
 
 - (void)dealloc {
     [self teardown];
+    if (_savedPhysMode) {
+        CGDisplayModeRelease(_savedPhysMode);
+        _savedPhysMode = NULL;
+    }
 }
 
 @end
