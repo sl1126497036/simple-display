@@ -1,5 +1,5 @@
 //
-//  BLVirtualScreen.h
+//  SDVirtualScreen.h
 //  一块物理显示器 ↔ 一块虚拟屏 的绑定。
 //  负责：建虚拟屏 → 自检 2× 背板 → 把物理屏硬件镜像到它 → 还原。
 //  每块物理屏一个实例，互不影响。
@@ -10,7 +10,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface BLVirtualScreen : NSObject
+@interface SDVirtualScreen : NSObject
 
 @property (nonatomic, readonly) CGDirectDisplayID physicalDisplayID;
 @property (nonatomic, readonly) CGDirectDisplayID virtualDisplayID;
@@ -19,7 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) CGSize pointSize;
 @property (nonatomic, readonly) double refreshRate;
 
-/// 该物理屏被镜像之前的原生像素尺寸。
+/// 该物理屏镜像前的原生像素尺寸。
 /// 成为 mirror slave 后模式表不再代表其自身，重扫时以此值兜底，
 /// 避免菜单显示虚拟屏的尺寸。
 @property (nonatomic, readonly) CGSize originalNativePixelSize;

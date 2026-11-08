@@ -1,17 +1,17 @@
 //
-//  BLDisplayInfo.m
+//  SDDisplayInfo.m
 //
 
-#import "BLDisplayInfo.h"
+#import "SDDisplayInfo.h"
 #import <AppKit/AppKit.h>
 
-static CFStringRef const kBLShowDuplicateModes = CFSTR("kCGDisplayShowDuplicateLowResolutionModes");
-static const double kBLMinPointWidth = 640.0;
-static const double kBLMinPointHeight = 360.0;
-static const double kBLAspectTolerance = 0.03;   // 3%
+static CFStringRef const kSDShowDuplicateModes = CFSTR("kCGDisplayShowDuplicateLowResolutionModes");
+static const double kSDMinPointWidth = 640.0;
+static const double kSDMinPointHeight = 360.0;
+static const double kSDAspectTolerance = 0.03;   // 3%
 
 /// 读取模式的像素尺寸；虚拟屏与镜像态下返回 0 时退化为点尺寸。
-static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
+static void SDPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     size_t pw = CGDisplayModeGetPixelWidth(m);
     size_t ph = CGDisplayModeGetPixelHeight(m);
     if (pw == 0 || ph == 0) { pw = CGDisplayModeGetWidth(m); ph = CGDisplayModeGetHeight(m); }
@@ -19,7 +19,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     if (h) *h = ph;
 }
 
-@implementation BLDisplayInfo {
+@implementation SDDisplayInfo {
     NSArray<NSValue *> *_pointSizes;
     NSArray<NSNumber *> *_refreshRates;
 }
@@ -30,7 +30,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     size_t bestW = 0, bestH = 0;
     BOOL sawUnscaled = NO;
 
-    NSDictionary *opts = @{ (__bridge NSString *)kBLShowDuplicateModes: @YES };
+    NSDictionary *opts = @{ (__bridge NSString *)kSDShowDuplicateModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, (__bridge CFDictionaryRef)opts);
 
     if (modes) {
@@ -42,7 +42,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
             CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
             size_t w = CGDisplayModeGetWidth(m), h = CGDisplayModeGetHeight(m);
             size_t pw, ph;
-            BLPixelSizeOfMode(m, &pw, &ph);
+            SDPixelSizeOfMode(m, &pw, &ph);
             if (pw != w || ph != h) continue;              // 缩放模式，跳过
             if ((double)w * (double)h > (double)bestW * (double)bestH) {
                 bestW = w; bestH = h; sawUnscaled = YES;
@@ -55,7 +55,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
             for (CFIndex i = 0; i < n; i++) {
                 CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
                 size_t pw, ph;
-                BLPixelSizeOfMode(m, &pw, &ph);
+                SDPixelSizeOfMode(m, &pw, &ph);
                 if ((double)pw * (double)ph > (double)pxW * (double)pxH) { pxW = pw; pxH = ph; }
             }
             if (pxW && pxH) { bestW = pxW; bestH = pxH; }
@@ -84,7 +84,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     }
     if (native.width <= 0 || native.height <= 0) return nil;
 
-    BLDisplayInfo *info = [[BLDisplayInfo alloc] init];
+    SDDisplayInfo *info = [[SDDisplayInfo alloc] init];
     if (!info) return nil;
 
     info->_displayID   = did;
@@ -93,8 +93,8 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     info->_aspectRatio = (double)info->_pixelWidth / (double)info->_pixelHeight;
     info->_isMain      = CGDisplayIsMain(did);
     info->_isBuiltin   = CGDisplayIsBuiltin(did);
-    info->_name        = [BLDisplayInfo nameForDisplay:did];
-    info->_aspectLabel = [BLDisplayInfo labelForAspect:info->_aspectRatio];
+    info->_name        = [SDDisplayInfo nameForDisplay:did];
+    info->_aspectLabel = [SDDisplayInfo labelForAspect:info->_aspectRatio];
 
     [info buildPointSizes];
     [info buildRefreshRates];
@@ -125,7 +125,7 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
         {5.0 / 4.0,   "5:4"},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
-        if (fabs(ar - table[i].ar) / table[i].ar <= kBLAspectTolerance) {
+        if (fabs(ar - table[i].ar) / table[i].ar <= kSDAspectTolerance) {
             return [NSString stringWithUTF8String:table[i].label];
         }
     }
@@ -146,16 +146,16 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     NSMutableDictionary<NSString *, NSValue *> *dict = [NSMutableDictionary dictionary];
 
     void (^add)(unsigned, unsigned) = ^(unsigned w, unsigned h) {
-        if ((double)w < kBLMinPointWidth || (double)h < kBLMinPointHeight) return;
+        if ((double)w < kSDMinPointWidth || (double)h < kSDMinPointHeight) return;
         double ar = (double)w / (double)h;
-        if (fabs(ar - _aspectRatio) / _aspectRatio > kBLAspectTolerance) return;
+        if (fabs(ar - _aspectRatio) / _aspectRatio > kSDAspectTolerance) return;
         NSString *key = [NSString stringWithFormat:@"%ux%u", w, h];
         if (!dict[key]) dict[key] = [NSValue valueWithSize:CGSizeMake(w, h)];
     };
 
     // 1) 这块屏自己认可的点尺寸（含系统已提供的 HiDPI 变体）。
     //    用点尺寸，因为虚拟屏的 CGVirtualDisplayMode 收的是点尺寸。
-    NSDictionary *opts = @{ (__bridge NSString *)kBLShowDuplicateModes: @YES };
+    NSDictionary *opts = @{ (__bridge NSString *)kSDShowDuplicateModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)opts);
     if (modes) {
         CFIndex n = CFArrayGetCount(modes);
@@ -194,14 +194,14 @@ static void BLPixelSizeOfMode(CGDisplayModeRef m, size_t *w, size_t *h) {
     // 筛选使用像素尺寸而非点尺寸：HiDPI 或缩放生效时点宽 != 像素宽，
     // 按点宽比对会筛掉全部模式，仅剩兜底值。
     // 50/56/67Hz 等刷新率通常属于其他分辨率，列出后无法落到实际模式。
-    NSDictionary *opts = @{ (__bridge NSString *)kBLShowDuplicateModes: @YES };
+    NSDictionary *opts = @{ (__bridge NSString *)kSDShowDuplicateModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(_displayID, (__bridge CFDictionaryRef)opts);
     if (modes) {
         CFIndex n = CFArrayGetCount(modes);
         for (CFIndex i = 0; i < n; i++) {
             CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
             size_t pw, ph;
-            BLPixelSizeOfMode(m, &pw, &ph);
+            SDPixelSizeOfMode(m, &pw, &ph);
             if (pw != _pixelWidth || ph != _pixelHeight) continue;
             double r = CGDisplayModeGetRefreshRate(m);
             if (r <= 1.0) continue;

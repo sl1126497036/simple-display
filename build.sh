@@ -1,16 +1,16 @@
 #!/bin/zsh
-# 构建 BetterLite VD.app
+# 构建 Simple Display.app
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="$DIR/build/BetterLite VD.app"
-BIN="BetterLiteVD"
+APP="$DIR/build/Simple Display.app"
+BIN="SimpleDisplay"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 clang -fobjc-arc -O2 -Wall \
-    -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
+    -framework Cocoa -framework CoreGraphics -framework ServiceManagement -framework IOKit \
     -o "$APP/Contents/MacOS/$BIN" \
     "$DIR"/Sources/*.m
 

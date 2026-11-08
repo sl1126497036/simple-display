@@ -1,5 +1,5 @@
 //
-//  BLDisplayInfo.h
+//  SDDisplayInfo.h
 //  一块物理显示器的静态信息与「可选点尺寸 / 刷新率」推导。
 //  全部按显示器自身的像素尺寸与宽高比推导，不假设任何固定分辨率。
 //
@@ -9,7 +9,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface BLDisplayInfo : NSObject
+@interface SDDisplayInfo : NSObject
 
 /// 物理屏 displayID
 @property (nonatomic, readonly) CGDirectDisplayID displayID;

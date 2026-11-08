@@ -1,34 +1,36 @@
 //
 //  main.m
-//  BetterLite VD — 用 CGVirtualDisplay 做真 2× HiDPI，并硬件镜像到物理屏。
+//  Simple Display — 用 CGVirtualDisplay 做真 2× HiDPI，并硬件镜像到物理屏。
 //
 //  用法：
-//    BetterLiteVD                        菜单栏常驻
-//    BetterLiteVD --apply W H [Hz] [ID]  启动即对某块屏应用（ID 缺省为主屏）
-//    BetterLiteVD --selftest             执行建屏/拆除/重建自检
-//    BetterLiteVD --diagnose             打印环境报告（提 issue 用）
-//    BetterLiteVD --login on|off         开启/关闭开机启动
-//    BetterLiteVD --login-status         打印开机启动状态
-//    BetterLiteVD --probe <displayID>    内部用：打印 "<点宽> <背板宽>"
-//    BetterLiteVD --modes <displayID>    内部用：逐行打印 "<点宽> <点高> <像素宽> <像素高>"
+//    SimpleDisplay                        菜单栏常驻
+//    SimpleDisplay --apply W H [Hz] [ID]  启动即对某块屏应用（ID 缺省为主屏）
+//    SimpleDisplay --selftest             执行建屏/拆除/重建自检
+//    SimpleDisplay --diagnose             打印环境报告（提 issue 用）
+//    SimpleDisplay --volume [0-100]      读取或设置显示器音量\n//    SimpleDisplay --login on|off         开启/关闭开机启动
+//    SimpleDisplay --login-status         打印开机启动状态
+//    SimpleDisplay --probe <displayID>    内部用：打印 "<点宽> <背板宽>"
+//    SimpleDisplay --modes <displayID>    内部用：逐行打印 "<点宽> <点高> <像素宽> <像素高>"
 //
 
 #import <Cocoa/Cocoa.h>
-#import "BLAppDelegate.h"
-#import "BLDisplayInfo.h"
-#import "BLVirtualScreen.h"
-#import "BLProbeCache.h"
+#import "SDAppDelegate.h"
+#import "SDDisplayInfo.h"
+#import "SDVirtualScreen.h"
+#import "SDProbeCache.h"
+#import "SDDisplayDDC.h"
 
 #import <ServiceManagement/ServiceManagement.h>
 
 #include <stdlib.h>
 #include <string.h>
 
-BOOL gBLRequestSelfTest = NO;
+BOOL gSDRequestSelfTest = NO;
+BOOL gSDRequestDumpMenu = NO;
 
 #pragma mark - 诊断
 
-static NSString *BLDisplayName(CGDirectDisplayID did) {
+static NSString *SDDisplayName(CGDirectDisplayID did) {
     for (NSScreen *s in [NSScreen screens]) {
         NSNumber *num = s.deviceDescription[@"NSScreenNumber"];
         if (num && num.unsignedIntValue == did && s.localizedName.length) return s.localizedName;
@@ -37,8 +39,8 @@ static NSString *BLDisplayName(CGDirectDisplayID did) {
 }
 
 /// 打印单块屏的完整信息，用于问题报告。
-static void BLReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
-    CGSize native = [BLDisplayInfo nativePixelSizeForDisplay:did];
+static void SDReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
+    CGSize native = [SDDisplayInfo nativePixelSizeForDisplay:did];
 
     size_t cw = 0, ch = 0, cpw = 0, cph = 0, oneX = 0, twoX = 0, other = 0;
     double chz = 0;
@@ -68,7 +70,7 @@ static void BLReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
     }
 
     printf("\n[%u] %s%s%s%s\n", did,
-           BLDisplayName(did).UTF8String,
+           SDDisplayName(did).UTF8String,
            CGDisplayIsMain(did) ? "  (main)" : "",
            CGDisplayIsBuiltin(did) ? "  (builtin)" : "",
            CGDisplayMirrorsDisplay(did) != kCGNullDirectDisplay ? "  (mirror-slave)" : "");
@@ -77,7 +79,7 @@ static void BLReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
     printf("  modes         : %zu total (%zu 1x, %zu 2x, %zu other)\n",
            oneX + twoX + other, oneX, twoX, other);
 
-    BLDisplayInfo *info = [BLDisplayInfo infoWithDisplayID:did];
+    SDDisplayInfo *info = [SDDisplayInfo infoWithDisplayID:did];
     if (info) {
         printf("  refresh rates : ");
         for (NSNumber *n in info.refreshRates) printf("%.2f ", n.doubleValue);
@@ -96,7 +98,7 @@ static void BLReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
             NSMutableArray<NSValue *> *ok = [NSMutableArray array];
             NSMutableArray<NSValue *> *bad = [NSMutableArray array];
             for (NSValue *v in info.pointSizes) {
-                int r = [BLVirtualScreen probeSizeIsHiDPI:v.sizeValue
+                int r = [SDVirtualScreen probeSizeIsHiDPI:v.sizeValue
                                        forPhysicalDisplay:did
                                               refreshRate:hz];
                 if (r == 1) [ok addObject:v]; else [bad addObject:v];
@@ -118,15 +120,15 @@ static void BLReportDisplay(CGDirectDisplayID did, BOOL withProbe) {
     }
 }
 
-static int BLRunDiagnose(BOOL withProbe) {
+static int SDRunDiagnose(BOOL withProbe) {
     NSProcessInfo *pi = [NSProcessInfo processInfo];
     NSOperatingSystemVersion v = pi.operatingSystemVersion;
 
-    printf("BetterLite VD diagnose\n");
+    printf("Simple Display diagnose\n");
     printf("  macOS         : %ld.%ld.%ld\n", (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion);
     printf("  host          : %s\n", pi.hostName.UTF8String);
     printf("  CGVirtualDisplay API : %s\n",
-           [BLVirtualScreen isPrivateAPIAvailable] ? "available" : "MISSING");
+           [SDVirtualScreen isPrivateAPIAvailable] ? "available" : "MISSING");
 
     uint32_t n = 0;
     CGDirectDisplayID ids[32];
@@ -134,11 +136,11 @@ static int BLRunDiagnose(BOOL withProbe) {
     printf("  online displays      : %u\n", n);
 
     for (uint32_t i = 0; i < n; i++) {
-        if ([BLVirtualScreen isOurVirtualDisplay:ids[i]]) {
-            printf("\n[%u] <BetterLite virtual display>\n", ids[i]);
+        if ([SDVirtualScreen isOurVirtualDisplay:ids[i]]) {
+            printf("\n[%u] <SimpleDisplay virtual display>\n", ids[i]);
             continue;
         }
-        BLReportDisplay(ids[i], withProbe);
+        SDReportDisplay(ids[i], withProbe);
     }
 
     fflush(stdout);
@@ -148,7 +150,7 @@ static int BLRunDiagnose(BOOL withProbe) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IONBF, 0);   // 自检/日志要即时可见
-        // 子进程探针，需在任何 UI 初始化之前返回。
+        // 子进程探针，需先于任何 UI 初始化返回。
         // 创建虚拟屏的进程内，CGDisplayCopyDisplayMode 返回 NULL，
         // CGDisplayPixelsWide 首帧返回点宽、重建时返回 0，无法判断 2× 背板是否存在。
         if (argc >= 3 && strcmp(argv[1], "--probe") == 0) {
@@ -186,7 +188,7 @@ int main(int argc, const char *argv[]) {
         if (argc >= 4 && strcmp(argv[1], "--probe-size") == 0) {
             CGSize s = CGSizeMake(atof(argv[2]), atof(argv[3]));
             CGDirectDisplayID did = argc >= 5 ? (CGDirectDisplayID)atoi(argv[4]) : CGMainDisplayID();
-            int r = [BLVirtualScreen probeSizeIsHiDPI:s forPhysicalDisplay:did refreshRate:100.0];
+            int r = [SDVirtualScreen probeSizeIsHiDPI:s forPhysicalDisplay:did refreshRate:100.0];
             printf("%s\n", r == 1 ? "2x" : (r == 0 ? "1x" : "fail"));
             fflush(stdout);
             return r == 1 ? 0 : 1;
@@ -194,7 +196,7 @@ int main(int argc, const char *argv[]) {
 
         if (argc >= 3 && strcmp(argv[1], "--probe-all") == 0) {
             CGDirectDisplayID did = (CGDirectDisplayID)atoi(argv[2]);
-            BLDisplayInfo *info = [BLDisplayInfo infoWithDisplayID:did];
+            SDDisplayInfo *info = [SDDisplayInfo infoWithDisplayID:did];
             if (!info) return 1;
 
             // 作为子进程调用时由父进程统一写入，避免并发写同一 plist
@@ -206,15 +208,40 @@ int main(int argc, const char *argv[]) {
             double hz = info.refreshRates.count ? info.refreshRates.lastObject.doubleValue : 60.0;
             for (NSValue *v in info.pointSizes) {
                 CGSize s = v.sizeValue;
-                int r = [BLVirtualScreen probeSizeIsHiDPI:s forPhysicalDisplay:did refreshRate:hz];
+                int r = [SDVirtualScreen probeSizeIsHiDPI:s forPhysicalDisplay:did refreshRate:hz];
                 printf("%u %u %d\n",
                        (unsigned)llround(s.width), (unsigned)llround(s.height), r);
                 fflush(stdout);   // 父进程是流式读的，必须逐行刷
                 if (r != -1 && !noCache) {
-                    [[BLProbeCache shared] setResult:(BLProbeResult)r forDisplay:did size:s];
+                    [[SDProbeCache shared] setResult:(SDProbeResult)r forDisplay:did size:s];
                 }
             }
-            if (!noCache) [[BLProbeCache shared] flushSync];
+            if (!noCache) [[SDProbeCache shared] flushSync];
+            return 0;
+        }
+
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--dump-menu") == 0) gSDRequestDumpMenu = YES;
+        }
+
+        if (argc >= 2 && strcmp(argv[1], "--volume") == 0) {
+            SDDisplayDDC *ddc = [[SDDisplayDDC alloc] init];
+            if (!ddc.isAvailable) { printf("unavailable\n"); return 1; }
+            NSError *err = nil;
+            if (![ddc reloadVolume:&err]) {
+                printf("read failed: %s\n", err.localizedDescription.UTF8String);
+                return 1;
+            }
+            if (argc >= 3) {
+                unsigned target = (unsigned)strtoul(argv[2], NULL, 10);
+                if (![ddc setVolume:target error:&err]) {
+                    printf("write failed: %s\n", err.localizedDescription.UTF8String);
+                    return 1;
+                }
+                usleep(150 * 1000);
+                [ddc reloadVolume:NULL];
+            }
+            printf("%u/%u\n", ddc.volume, ddc.maximum);
             return 0;
         }
 
@@ -259,17 +286,17 @@ int main(int argc, const char *argv[]) {
         }
 
         if (argc >= 2 && strcmp(argv[1], "--diagnose") == 0) {
-            return BLRunDiagnose(argc >= 3 && strcmp(argv[2], "--probe") == 0);
+            return SDRunDiagnose(argc >= 3 && strcmp(argv[2], "--probe") == 0);
         }
 
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        BLAppDelegate *delegate = [[BLAppDelegate alloc] init];
+        SDAppDelegate *delegate = [[SDAppDelegate alloc] init];
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--selftest") == 0) {
-                gBLRequestSelfTest = YES;
+                gSDRequestSelfTest = YES;
             } else if (strcmp(argv[i], "--apply") == 0 && i + 2 < argc) {
                 delegate.hasStartupRequest = YES;
                 delegate.startupSize = CGSizeMake(atof(argv[i + 1]), atof(argv[i + 2]));

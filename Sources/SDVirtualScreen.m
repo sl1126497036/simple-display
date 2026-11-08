@@ -1,9 +1,9 @@
 //
-//  BLVirtualScreen.m
+//  SDVirtualScreen.m
 //
 
-#import "BLVirtualScreen.h"
-#import "BLDisplayInfo.h"
+#import "SDVirtualScreen.h"
+#import "SDDisplayInfo.h"
 #import "CGVirtualDisplayPrivate.h"
 
 #include <unistd.h>
@@ -11,14 +11,14 @@
 #include <signal.h>
 #include <stdlib.h>
 
-static NSString * const BLVDErrorDomain = @"BetterLiteVD";
+static NSString * const SDVDErrorDomain = @"SimpleDisplay";
 
-/// 本工具创建的虚拟屏使用该 vendorID（'BL'），重扫时据此排除。
-static const unsigned int kBLVendorID = 0x424C;
+/// 本工具创建的虚拟屏使用该 vendorID（'SD'），重扫时据此排除。
+static const unsigned int kSDVendorID = 0x5344;
 
 #pragma mark - 自身可执行路径 / 子进程
 
-static const char *BLExecutablePath(void) {
+static const char *SDExecutablePath(void) {
     static char *resolved = NULL;
     if (resolved) return resolved;
     NSString *p = [NSBundle mainBundle].executablePath;
@@ -36,8 +36,8 @@ static const char *BLExecutablePath(void) {
 /// 读取真实模式的调用一律走子进程。创建虚拟屏的进程内，
 /// CGDisplayCopyAllDisplayModes / CGDisplayCopyDisplayMode 返回 NULL 或陈旧值，
 /// CGDisplayPixelsWide 首帧返回点宽、重建时返回 0，均不可作为判断依据。
-static NSData *BLRunSelf(NSString *a1, NSString *a2) {
-    const char *exe = BLExecutablePath();
+static NSData *SDRunSelf(NSString *a1, NSString *a2) {
+    const char *exe = SDExecutablePath();
     if (!exe) return nil;
 
     int fds[2];
@@ -66,8 +66,8 @@ static NSData *BLRunSelf(NSString *a1, NSString *a2) {
 }
 
 /// 读某块屏「当前模式」的点宽 / 像素宽。自检 2× 背板用。
-static BOOL BLProbeCurrentMode(CGDirectDisplayID vid, size_t *pointW, size_t *pixelW) {
-    NSData *d = BLRunSelf(@"--probe", [NSString stringWithFormat:@"%u", vid]);
+static BOOL SDProbeCurrentMode(CGDirectDisplayID vid, size_t *pointW, size_t *pixelW) {
+    NSData *d = SDRunSelf(@"--probe", [NSString stringWithFormat:@"%u", vid]);
     if (!d) return NO;
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
     if (!s) return NO;
@@ -85,17 +85,17 @@ static BOOL BLProbeCurrentMode(CGDirectDisplayID vid, size_t *pointW, size_t *pi
 /// 在物理屏的模式表里找与目标刷新率最接近、且像素尺寸为面板原生的模式。
 /// 硬件镜像不会自己把 slave 的刷新率改成 master 的，必须先手动对齐，否则两边各扫各的。
 ///
-/// 比对使用像素尺寸，原生像素由 BLDisplayInfo 推断。
+/// 比对使用像素尺寸，原生像素由 SDDisplayInfo 推断。
 /// 以 CGDisplayPixelsWide 作为原生值会在两种情况下失配：
 ///   1. 系统缩放或其它 HiDPI 工具生效时，该值等于当前模式的像素宽，非面板原生；
 ///   2. HiDPI 生效时，该值为背板宽（2×），无法匹配任何 1× 模式。
 /// 失配导致 master 与 slave 刷新率不一致，画面周期性抖动。
-static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) {
+static CGDisplayModeRef SDCopyAlignedMode(CGDirectDisplayID did, double wantHz) {
     NSDictionary *opts = @{ (__bridge NSString *)CFSTR("kCGDisplayShowDuplicateLowResolutionModes"): @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, (__bridge CFDictionaryRef)opts);
     if (!modes) return NULL;
 
-    CGSize native = [BLDisplayInfo nativePixelSizeForDisplay:did];
+    CGSize native = [SDDisplayInfo nativePixelSizeForDisplay:did];
     size_t nativeW = (size_t)llround(native.width);
     size_t nativeH = (size_t)llround(native.height);
     if (nativeW == 0 || nativeH == 0) { CFRelease(modes); return NULL; }
@@ -126,7 +126,7 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
 /// 像素上限按候选中的最大尺寸计算。
 /// 5K 屏点宽 5120 需要 10240 背板，6K 点宽 6016 需要 12032；
 /// 固定为 8192 会使这两类屏建屏失败。
-static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
+static CGVirtualDisplay *SDMakeVirtualDisplay(CGDirectDisplayID physID,
                                               NSArray<NSValue *> *pointSizes,
                                               double hz,
                                               NSError **error) {
@@ -145,12 +145,12 @@ static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
     if (modes.count == 0) return nil;
 
     CGVirtualDisplayDescriptor *d = [[CGVirtualDisplayDescriptor alloc] init];
-    d.name = [NSString stringWithFormat:@"BetterLite %u", physID];
+    d.name = [NSString stringWithFormat:@"SimpleDisplay %u", physID];
 
     unsigned needW = (unsigned)MAX((double)maxPtW * 2.0 + 64.0, 1024.0);
     unsigned needH = (unsigned)MAX((double)maxPtH * 2.0 + 64.0, 768.0);
     // 可用环境变量抬下限做对照实验（排查「降级是否与 maxPixels 相关」）
-    const char *env = getenv("BL_MIN_MAXPIXELS");
+    const char *env = getenv("SD_MIN_MAXPIXELS");
     if (env) {
         unsigned floorPx = (unsigned)atoi(env);
         needW = MAX(needW, floorPx);
@@ -159,14 +159,14 @@ static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
     d.maxPixelsWide = needW;
     d.maxPixelsHigh = needH;
     d.sizeInMillimeters = CGDisplayScreenSize(physID);
-    d.vendorID = kBLVendorID;             // 'BL'：标识本工具创建的屏
+    d.vendorID = kSDVendorID;             // 'SD'：标识本工具创建的屏
     d.productID = physID;                 // 每块屏唯一，避免多屏时撞车
     d.serialNum = physID;
     d.queue = dispatch_get_main_queue();
 
     CGVirtualDisplay *vd = [[CGVirtualDisplay alloc] initWithDescriptor:d];
     if (!vd) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:2
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:2
                                             userInfo:@{NSLocalizedDescriptionKey:
                           @"虚拟屏初始化返回 nil。可能是 maxPixels 超出本机渲染能力。"}];
         return nil;
@@ -176,7 +176,7 @@ static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
     st.hiDPI = 1;
     st.modes = modes;
     if (![vd applySettings:st]) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:3
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:3
                                             userInfo:@{NSLocalizedDescriptionKey:
                           @"applySettings 返回 NO。系统拒绝了这组模式。"}];
         return nil;
@@ -184,7 +184,7 @@ static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
     return vd;
 }
 
-static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
+static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     for (int i = 0; i < tries; i++) {
         uint32_t n = 0;
         CGDirectDisplayID ids[32];
@@ -198,7 +198,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 
 #pragma mark -
 
-@implementation BLVirtualScreen {
+@implementation SDVirtualScreen {
     CGVirtualDisplay *_vd;
     CGDirectDisplayID _virtualDisplayID;
     BOOL _active;
@@ -250,7 +250,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 
 + (BOOL)isOurVirtualDisplay:(CGDirectDisplayID)did {
     if (did == kCGNullDirectDisplay) return NO;
-    return CGDisplayVendorNumber(did) == kBLVendorID;
+    return CGDisplayVendorNumber(did) == kSDVendorID;
 }
 
 #pragma mark - 探测可用尺寸
@@ -263,18 +263,18 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     if (![self isPrivateAPIAvailable] || w < 320 || h < 200) return -1;
 
     // 探测屏不镜像，短暂存在后即销毁，不改变当前画面。
-    CGVirtualDisplay *vd = BLMakeVirtualDisplay(physID,
+    CGVirtualDisplay *vd = SDMakeVirtualDisplay(physID,
                                                @[[NSValue valueWithSize:CGSizeMake(w, h)]],
                                                hz, NULL);
     if (!vd) return -1;
 
     CGDirectDisplayID vid = vd.displayID;
-    BLWaitVirtualOnline(vid, 40);
+    SDWaitVirtualOnline(vid, 40);
 
     int result = -1;
     for (int i = 0; i < 12; i++) {
         size_t pointW = 0, pixelW = 0;
-        if (BLProbeCurrentMode(vid, &pointW, &pixelW)) {
+        if (SDProbeCurrentMode(vid, &pointW, &pixelW)) {
             result = (pointW == (size_t)w && pixelW == (size_t)w * 2) ? 1 : 0;
             break;
         }
@@ -309,15 +309,15 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     unsigned wantW = (unsigned)llround(size.width);
     unsigned wantH = (unsigned)llround(size.height);
 
-    if (![BLVirtualScreen isPrivateAPIAvailable]) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:6
+    if (![SDVirtualScreen isPrivateAPIAvailable]) {
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:6
                                             userInfo:@{NSLocalizedDescriptionKey:
                           @"当前系统缺少 CGVirtualDisplay 私有 API（需要 macOS 11 及以上）。"}];
         return NO;
     }
 
     if (wantW < 320 || wantH < 200) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:1
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:1
                                             userInfo:@{NSLocalizedDescriptionKey: @"请求的尺寸过小。"}];
         return NO;
     }
@@ -337,7 +337,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     // 成为 mirror slave 后模式表不再代表该屏自身，重扫时读取会得到虚拟屏的尺寸。
     // 首次应用时记录，后续沿用。
     if (_originalNative.width <= 0 || _originalNative.height <= 0) {
-        _originalNative = [BLDisplayInfo nativePixelSizeForDisplay:_physicalDisplayID];
+        _originalNative = [SDDisplayInfo nativePixelSizeForDisplay:_physicalDisplayID];
     }
 
     // 记下物理屏此刻的原生模式（首次应用时）。对齐刷新率会改它，还原时要换回来。
@@ -347,7 +347,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 
     // 先将物理屏切换到目标刷新率。硬件镜像不同步 slave 的刷新率，
     // 未对齐时 master 与 slave 各自刷新，画面周期性抖动。
-    CGDisplayModeRef aligned = BLCopyAlignedMode(_physicalDisplayID, hz);
+    CGDisplayModeRef aligned = SDCopyAlignedMode(_physicalDisplayID, hz);
     if (aligned) {
         double exact = CGDisplayModeGetRefreshRate(aligned);
         if (exact > 1.0) hz = exact;      // 沿用面板的精确刷新率，避免 99.86 vs 100.00 的节拍差
@@ -364,7 +364,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
         usleep(350 * 1000);
     }
 
-    CGVirtualDisplay *vd = BLMakeVirtualDisplay(_physicalDisplayID,
+    CGVirtualDisplay *vd = SDMakeVirtualDisplay(_physicalDisplayID,
                                                @[[NSValue valueWithSize:CGSizeMake(wantW, wantH)]],
                                                hz, error);
     if (!vd) return NO;
@@ -372,12 +372,12 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     _vd = vd;
     _virtualDisplayID = vd.displayID;
 
-    BLWaitVirtualOnline(_virtualDisplayID, 60);
+    SDWaitVirtualOnline(_virtualDisplayID, 60);
     usleep(500 * 1000);
 
     // 自检：2× 背板是否存在
     if (![self verifyHiDPIExpectWidth:wantW]) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:4
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:4
                                             userInfo:@{NSLocalizedDescriptionKey:
                           [NSString stringWithFormat:@"%u × %u 没能生成 2× 背板，系统会把它当成 1× 铺满屏幕。",
                            wantW, wantH]}];
@@ -402,7 +402,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     }
 
     if (e != kCGErrorSuccess) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:5
+        if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:5
                                             userInfo:@{NSLocalizedDescriptionKey:
                           [NSString stringWithFormat:@"镜像失败（错误码 %d）。", e]}];
         [self teardown];
@@ -418,7 +418,7 @@ static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 - (BOOL)verifyHiDPIExpectWidth:(unsigned)wantW {
     for (int i = 0; i < 25; i++) {
         size_t pointW = 0, pixelW = 0;
-        if (BLProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW)) {
+        if (SDProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW)) {
             return (pointW == (size_t)wantW) && (pixelW == (size_t)wantW * 2);
         }
         usleep(250 * 1000);

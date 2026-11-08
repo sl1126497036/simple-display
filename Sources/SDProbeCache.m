@@ -1,19 +1,19 @@
 //
-//  BLProbeCache.m
+//  SDProbeCache.m
 //
 
-#import "BLProbeCache.h"
-#import "BLDisplayInfo.h"
+#import "SDProbeCache.h"
+#import "SDDisplayInfo.h"
 
-@implementation BLProbeCache {
+@implementation SDProbeCache {
     NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *_store;
     BOOL _dirty;
 }
 
 + (instancetype)shared {
-    static BLProbeCache *shared = nil;
+    static SDProbeCache *shared = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ shared = [[BLProbeCache alloc] init]; });
+    dispatch_once(&once, ^{ shared = [[SDProbeCache alloc] init]; });
     return shared;
 }
 
@@ -30,10 +30,10 @@
 /// 显示器身份由 vendor、model 与面板原生像素组成。
 /// displayID 随插拔与重启变化，单独使用会使记录失效；
 /// 仅用 vendor+model 无法区分同型号的两块屏。
-static NSString *BLDisplayKey(CGDirectDisplayID did) {
+static NSString *SDDisplayKey(CGDirectDisplayID did) {
     uint32_t vendor = CGDisplayVendorNumber(did);
     uint32_t model  = CGDisplayModelNumber(did);
-    CGSize native = [BLDisplayInfo nativePixelSizeForDisplay:did];
+    CGSize native = [SDDisplayInfo nativePixelSizeForDisplay:did];
     if (native.width <= 0 || native.height <= 0) {
         native = CGSizeMake(CGDisplayPixelsWide(did), CGDisplayPixelsHigh(did));
     }
@@ -41,46 +41,46 @@ static NSString *BLDisplayKey(CGDirectDisplayID did) {
             vendor, model, (size_t)llround(native.width), (size_t)llround(native.height)];
 }
 
-static NSString *BLSizeKey(CGSize size) {
+static NSString *SDSizeKey(CGSize size) {
     return [NSString stringWithFormat:@"%ux%u",
             (unsigned)llround(size.width), (unsigned)llround(size.height)];
 }
 
 #pragma mark - 读写
 
-- (BLProbeResult)resultForDisplay:(CGDirectDisplayID)did size:(CGSize)size {
-    NSDictionary *perSize = _store[BLDisplayKey(did)];
-    NSNumber *n = perSize[BLSizeKey(size)];
-    return n ? (BLProbeResult)n.integerValue : BLProbeResultUnknown;
+- (SDProbeResult)resultForDisplay:(CGDirectDisplayID)did size:(CGSize)size {
+    NSDictionary *perSize = _store[SDDisplayKey(did)];
+    NSNumber *n = perSize[SDSizeKey(size)];
+    return n ? (SDProbeResult)n.integerValue : SDProbeResultUnknown;
 }
 
-- (void)setResult:(BLProbeResult)result forDisplay:(CGDirectDisplayID)did size:(CGSize)size {
-    if (result == BLProbeResultUnknown) return;
-    NSString *key = BLDisplayKey(did);
+- (void)setResult:(SDProbeResult)result forDisplay:(CGDirectDisplayID)did size:(CGSize)size {
+    if (result == SDProbeResultUnknown) return;
+    NSString *key = SDDisplayKey(did);
     NSMutableDictionary *perSize = _store[key];
     if (!perSize) {
         perSize = [NSMutableDictionary dictionary];
         _store[key] = perSize;
     }
-    perSize[BLSizeKey(size)] = @(result);
+    perSize[SDSizeKey(size)] = @(result);
     _dirty = YES;
     [self flush];
 }
 
 - (BOOL)hasAnyResultForDisplay:(CGDirectDisplayID)did {
-    return _store[BLDisplayKey(did)].count > 0;
+    return _store[SDDisplayKey(did)].count > 0;
 }
 
 - (NSUInteger)hiDPICountForDisplay:(CGDirectDisplayID)did {
     NSUInteger n = 0;
-    for (NSNumber *v in _store[BLDisplayKey(did)].allValues) {
-        if (v.integerValue == BLProbeResultHiDPI) n++;
+    for (NSNumber *v in _store[SDDisplayKey(did)].allValues) {
+        if (v.integerValue == SDProbeResultHiDPI) n++;
     }
     return n;
 }
 
 - (void)forgetDisplay:(CGDirectDisplayID)did {
-    [_store removeObjectForKey:BLDisplayKey(did)];
+    [_store removeObjectForKey:SDDisplayKey(did)];
     _dirty = YES;
     [self flush];
 }
@@ -90,7 +90,7 @@ static NSString *BLSizeKey(CGSize size) {
 - (NSString *)cachePath {
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
                                                          NSUserDomainMask, YES).firstObject
-                     stringByAppendingPathComponent:@"BetterLiteVD"];
+                     stringByAppendingPathComponent:@"SimpleDisplay"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
                               withIntermediateDirectories:YES
                                                attributes:nil

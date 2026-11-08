@@ -1,6 +1,6 @@
 //
-//  BLAppDelegate.h
-//  菜单栏主控：为每块物理显示器维护一个 BLVirtualScreen 实例。
+//  SDAppDelegate.h
+//  菜单栏主控：为当前显示器维护一块虚拟屏，并提供分辨率、刷新率与音量控制。
 //
 
 #import <Cocoa/Cocoa.h>
@@ -8,19 +8,13 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface BLAppDelegate : NSObject <NSApplicationDelegate>
+@interface SDAppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 
-/// 重新枚举显示器并重建菜单（显示器插拔后也可调用）
-- (void)rescan;
-
-/// 对某块物理屏应用一组点尺寸 / 刷新率
+/// 对当前显示器应用一组点尺寸 / 刷新率
 - (void)applyToDisplay:(CGDirectDisplayID)physID size:(CGSize)size refreshRate:(double)hz;
 
-/// 关闭某块屏的虚拟屏
-- (void)turnOffDisplay:(CGDirectDisplayID)physID;
-
-/// 关闭全部
-- (void)turnOffAll;
+/// 关闭虚拟屏，恢复物理屏
+- (void)turnOff;
 
 /// 自检入口（--selftest）
 - (void)runSelfTest;
