@@ -30,7 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 @interface CGVirtualDisplaySettings : NSObject
-/// 1 = 请求 2× 背板。注意：系统不保证满足，部分尺寸会被降级成 1×。
+/// 1 = 请求 2× 背板。系统不保证满足，部分尺寸会降级为 1×。
 @property (nonatomic) unsigned int hiDPI;
 @property (nonatomic, copy, nullable) NSArray *modes;
 @end

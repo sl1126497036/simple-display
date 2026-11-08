@@ -3,6 +3,7 @@
 //
 
 #import "BLVirtualScreen.h"
+#import "BLDisplayInfo.h"
 #import "CGVirtualDisplayPrivate.h"
 
 #include <unistd.h>
@@ -12,7 +13,10 @@
 
 static NSString * const BLVDErrorDomain = @"BetterLiteVD";
 
-#pragma mark - 自身可执行路径
+/// 本工具创建的虚拟屏使用该 vendorID（'BL'），重扫时据此排除。
+static const unsigned int kBLVendorID = 0x424C;
+
+#pragma mark - 自身可执行路径 / 子进程
 
 static const char *BLExecutablePath(void) {
     static char *resolved = NULL;
@@ -27,40 +31,52 @@ static const char *BLExecutablePath(void) {
     return resolved;
 }
 
-#pragma mark - 外部探针（唯一可靠的 HiDPI 判据）
+/// fork + exec 自己，跑一个只读子命令并把 stdout 全收下来。
+///
+/// 读取真实模式的调用一律走子进程。创建虚拟屏的进程内，
+/// CGDisplayCopyAllDisplayModes / CGDisplayCopyDisplayMode 返回 NULL 或陈旧值，
+/// CGDisplayPixelsWide 首帧返回点宽、重建时返回 0，均不可作为判断依据。
+static NSData *BLRunSelf(NSString *a1, NSString *a2) {
+    const char *exe = BLExecutablePath();
+    if (!exe) return nil;
 
-/// 起一个子进程读某块屏的真实模式。成功时写入点宽/背板宽。
-/// 之所以必须用子进程：在创建虚拟屏的进程内，CGDisplayCopyDisplayMode 返回 NULL，
-/// CGDisplayPixelsWide 在建屏首帧返回点宽、重建时返回 0，都不可信。
-static BOOL BLProbeDisplay(const char *exe, CGDirectDisplayID vid, size_t *outPointW, size_t *outPixelW) {
     int fds[2];
-    if (pipe(fds) != 0) return NO;
+    if (pipe(fds) != 0) return nil;
 
     pid_t pid = fork();
-    if (pid == 0) {
+    if (pid == 0) {                      // 子进程
         close(fds[0]);
         dup2(fds[1], STDOUT_FILENO);
         close(fds[1]);
-        char idbuf[24];
-        snprintf(idbuf, sizeof idbuf, "%u", vid);
-        execl(exe, exe, "--probe", idbuf, (char *)NULL);
+        execl(exe, exe, a1.UTF8String, a2.UTF8String, (char *)NULL);
         _exit(127);
     }
-    if (pid < 0) { close(fds[0]); close(fds[1]); return NO; }
+    if (pid < 0) { close(fds[0]); close(fds[1]); return nil; }
 
     close(fds[1]);
-    char out[64] = {0};
-    ssize_t n = read(fds[0], out, sizeof out - 1);
+    NSMutableData *buf = [NSMutableData data];
+    char tmp[8192];
+    ssize_t n;
+    while ((n = read(fds[0], tmp, sizeof tmp)) > 0) [buf appendBytes:tmp length:(NSUInteger)n];
     close(fds[0]);
 
     int status = 0;
     waitpid(pid, &status, 0);
-    if (n <= 0) return NO;
+    return buf.length ? buf : nil;
+}
+
+/// 读某块屏「当前模式」的点宽 / 像素宽。自检 2× 背板用。
+static BOOL BLProbeCurrentMode(CGDirectDisplayID vid, size_t *pointW, size_t *pixelW) {
+    NSData *d = BLRunSelf(@"--probe", [NSString stringWithFormat:@"%u", vid]);
+    if (!d) return NO;
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!s) return NO;
 
     size_t mw = 0, pw = 0;
-    if (sscanf(out, "%zu %zu", &mw, &pw) != 2) return NO;
-    if (outPointW) *outPointW = mw;
-    if (outPixelW) *outPixelW = pw;
+    if (sscanf(s.UTF8String, "%zu %zu", &mw, &pw) != 2) return NO;
+    if (mw == 0) return NO;
+    if (pointW) *pointW = mw;
+    if (pixelW) *pixelW = pw;
     return YES;
 }
 
@@ -68,20 +84,31 @@ static BOOL BLProbeDisplay(const char *exe, CGDirectDisplayID vid, size_t *outPo
 
 /// 在物理屏的模式表里找与目标刷新率最接近、且像素尺寸为面板原生的模式。
 /// 硬件镜像不会自己把 slave 的刷新率改成 master 的，必须先手动对齐，否则两边各扫各的。
+///
+/// 比对使用像素尺寸，原生像素由 BLDisplayInfo 推断。
+/// 以 CGDisplayPixelsWide 作为原生值会在两种情况下失配：
+///   1. 系统缩放或其它 HiDPI 工具生效时，该值等于当前模式的像素宽，非面板原生；
+///   2. HiDPI 生效时，该值为背板宽（2×），无法匹配任何 1× 模式。
+/// 失配导致 master 与 slave 刷新率不一致，画面周期性抖动。
 static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) {
     NSDictionary *opts = @{ (__bridge NSString *)CFSTR("kCGDisplayShowDuplicateLowResolutionModes"): @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, (__bridge CFDictionaryRef)opts);
     if (!modes) return NULL;
 
-    size_t nativeW = CGDisplayPixelsWide(did);
-    size_t nativeH = CGDisplayPixelsHigh(did);
+    CGSize native = [BLDisplayInfo nativePixelSizeForDisplay:did];
+    size_t nativeW = (size_t)llround(native.width);
+    size_t nativeH = (size_t)llround(native.height);
+    if (nativeW == 0 || nativeH == 0) { CFRelease(modes); return NULL; }
 
     CGDisplayModeRef best = NULL;
     double bestDiff = 1e9;
     CFIndex n = CFArrayGetCount(modes);
     for (CFIndex i = 0; i < n; i++) {
         CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
-        if (CGDisplayModeGetWidth(m) != nativeW || CGDisplayModeGetHeight(m) != nativeH) continue;
+        size_t pw = CGDisplayModeGetPixelWidth(m);
+        size_t ph = CGDisplayModeGetPixelHeight(m);
+        if (pw == 0 || ph == 0) { pw = CGDisplayModeGetWidth(m); ph = CGDisplayModeGetHeight(m); }
+        if (pw != nativeW || ph != nativeH) continue;
         double r = CGDisplayModeGetRefreshRate(m);
         if (r <= 1.0) continue;
         double diff = fabs(r - wantHz);
@@ -92,6 +119,83 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
     return (CGDisplayModeRef)CFRetain(best);
 }
 
+#pragma mark - 建屏 / 等待
+
+/// 建一块虚拟屏并申请一组点尺寸（统一 hiDPI）。
+///
+/// 像素上限按候选中的最大尺寸计算。
+/// 5K 屏点宽 5120 需要 10240 背板，6K 点宽 6016 需要 12032；
+/// 固定为 8192 会使这两类屏建屏失败。
+static CGVirtualDisplay *BLMakeVirtualDisplay(CGDirectDisplayID physID,
+                                              NSArray<NSValue *> *pointSizes,
+                                              double hz,
+                                              NSError **error) {
+    unsigned maxPtW = 0, maxPtH = 0;
+    NSMutableArray<CGVirtualDisplayMode *> *modes = [NSMutableArray array];
+
+    for (NSValue *v in pointSizes) {
+        CGSize s = v.sizeValue;
+        unsigned w = (unsigned)llround(s.width);
+        unsigned h = (unsigned)llround(s.height);
+        if (w < 320 || h < 200) continue;
+        if (w > maxPtW) maxPtW = w;
+        if (h > maxPtH) maxPtH = h;
+        [modes addObject:[[CGVirtualDisplayMode alloc] initWithWidth:w height:h refreshRate:hz]];
+    }
+    if (modes.count == 0) return nil;
+
+    CGVirtualDisplayDescriptor *d = [[CGVirtualDisplayDescriptor alloc] init];
+    d.name = [NSString stringWithFormat:@"BetterLite %u", physID];
+
+    unsigned needW = (unsigned)MAX((double)maxPtW * 2.0 + 64.0, 1024.0);
+    unsigned needH = (unsigned)MAX((double)maxPtH * 2.0 + 64.0, 768.0);
+    // 可用环境变量抬下限做对照实验（排查「降级是否与 maxPixels 相关」）
+    const char *env = getenv("BL_MIN_MAXPIXELS");
+    if (env) {
+        unsigned floorPx = (unsigned)atoi(env);
+        needW = MAX(needW, floorPx);
+        needH = MAX(needH, floorPx);
+    }
+    d.maxPixelsWide = needW;
+    d.maxPixelsHigh = needH;
+    d.sizeInMillimeters = CGDisplayScreenSize(physID);
+    d.vendorID = kBLVendorID;             // 'BL'：标识本工具创建的屏
+    d.productID = physID;                 // 每块屏唯一，避免多屏时撞车
+    d.serialNum = physID;
+    d.queue = dispatch_get_main_queue();
+
+    CGVirtualDisplay *vd = [[CGVirtualDisplay alloc] initWithDescriptor:d];
+    if (!vd) {
+        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:2
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                          @"虚拟屏初始化返回 nil。可能是 maxPixels 超出本机渲染能力。"}];
+        return nil;
+    }
+
+    CGVirtualDisplaySettings *st = [[CGVirtualDisplaySettings alloc] init];
+    st.hiDPI = 1;
+    st.modes = modes;
+    if (![vd applySettings:st]) {
+        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:3
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                          @"applySettings 返回 NO。系统拒绝了这组模式。"}];
+        return nil;
+    }
+    return vd;
+}
+
+static void BLWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
+    for (int i = 0; i < tries; i++) {
+        uint32_t n = 0;
+        CGDirectDisplayID ids[32];
+        CGGetOnlineDisplayList(32, ids, &n);
+        BOOL found = NO;
+        for (uint32_t k = 0; k < n; k++) if (ids[k] == vid) { found = YES; break; }
+        if (found && CGDisplayIsActive(vid)) return;
+        usleep(50 * 1000);
+    }
+}
+
 #pragma mark -
 
 @implementation BLVirtualScreen {
@@ -100,6 +204,7 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
     BOOL _active;
     CGSize _pointSize;
     double _refreshRate;
+    CGSize _originalNative;            // 被镜像前的原生像素尺寸
     CGDisplayModeRef _savedPhysMode;   // 对齐刷新率前的物理屏模式，还原时恢复
 }
 
@@ -118,12 +223,98 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
 - (BOOL)active { return _active; }
 - (CGSize)pointSize { return _pointSize; }
 - (double)refreshRate { return _refreshRate; }
+- (CGSize)originalNativePixelSize { return _originalNative; }
+
+#pragma mark - 能力检测
+
++ (BOOL)isPrivateAPIAvailable {
+    static int cached = -1;
+    if (cached >= 0) return cached == 1;
+
+    // CGVirtualDisplay 是私有类。系统移除或版本不支持时，alloc/init 会抛出
+    // unrecognized selector 导致崩溃，因此先检查类与方法是否存在。
+    Class desc = NSClassFromString(@"CGVirtualDisplayDescriptor");
+    Class vd   = NSClassFromString(@"CGVirtualDisplay");
+    Class st   = NSClassFromString(@"CGVirtualDisplaySettings");
+    Class md   = NSClassFromString(@"CGVirtualDisplayMode");
+
+    BOOL ok = (desc && vd && st && md)
+           && [vd instancesRespondToSelector:@selector(initWithDescriptor:)]
+           && [vd instancesRespondToSelector:@selector(applySettings:)]
+           && [st instancesRespondToSelector:@selector(setHiDPI:)]
+           && [md instancesRespondToSelector:@selector(initWithWidth:height:refreshRate:)];
+
+    cached = ok ? 1 : 0;
+    return ok;
+}
+
++ (BOOL)isOurVirtualDisplay:(CGDirectDisplayID)did {
+    if (did == kCGNullDirectDisplay) return NO;
+    return CGDisplayVendorNumber(did) == kBLVendorID;
+}
+
+#pragma mark - 探测可用尺寸
+
++ (int)probeSizeIsHiDPI:(CGSize)size
+     forPhysicalDisplay:(CGDirectDisplayID)physID
+            refreshRate:(double)hz {
+    unsigned w = (unsigned)llround(size.width);
+    unsigned h = (unsigned)llround(size.height);
+    if (![self isPrivateAPIAvailable] || w < 320 || h < 200) return -1;
+
+    // 探测屏不镜像，短暂存在后即销毁，不改变当前画面。
+    CGVirtualDisplay *vd = BLMakeVirtualDisplay(physID,
+                                               @[[NSValue valueWithSize:CGSizeMake(w, h)]],
+                                               hz, NULL);
+    if (!vd) return -1;
+
+    CGDirectDisplayID vid = vd.displayID;
+    BLWaitVirtualOnline(vid, 40);
+
+    int result = -1;
+    for (int i = 0; i < 12; i++) {
+        size_t pointW = 0, pixelW = 0;
+        if (BLProbeCurrentMode(vid, &pointW, &pixelW)) {
+            result = (pointW == (size_t)w && pixelW == (size_t)w * 2) ? 1 : 0;
+            break;
+        }
+        usleep(120 * 1000);
+    }
+
+    (void)vd;              // 出作用域即释放 → 销毁
+    usleep(200 * 1000);    // 留出销毁间隔，避免下次建屏处于过渡态
+    return result;
+}
+
++ (NSArray<NSValue *> *)probeHiDPISizesForPhysicalDisplay:(CGDirectDisplayID)physID
+                                              pointSizes:(NSArray<NSValue *> *)candidates
+                                             refreshRate:(double)hz {
+    if (![self isPrivateAPIAvailable] || candidates.count == 0) return @[];
+
+    // 逐个尺寸建屏探测：虚拟屏的模式表无法枚举（CGDisplayCopyAllDisplayModes 返回空），
+    // 只能读取「当前模式」判断该尺寸是否获得 2× 背板。
+    // 单档耗时约 1~2 秒，仅在主动检测时全量执行，其余情况读取缓存。
+    NSMutableArray<NSValue *> *ok = [NSMutableArray array];
+    for (NSValue *v in candidates) {
+        if ([self probeSizeIsHiDPI:v.sizeValue forPhysicalDisplay:physID refreshRate:hz] == 1) {
+            [ok addObject:v];
+        }
+    }
+    return ok;
+}
 
 #pragma mark - 应用
 
 - (BOOL)applyPointSize:(CGSize)size refreshRate:(double)hz error:(NSError **)error {
     unsigned wantW = (unsigned)llround(size.width);
     unsigned wantH = (unsigned)llround(size.height);
+
+    if (![BLVirtualScreen isPrivateAPIAvailable]) {
+        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:6
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                          @"当前系统缺少 CGVirtualDisplay 私有 API（需要 macOS 11 及以上）。"}];
+        return NO;
+    }
 
     if (wantW < 320 || wantH < 200) {
         if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:1
@@ -142,13 +333,20 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
     }
     usleep(400 * 1000);
 
+    // 记录被镜像前的原生像素尺寸。
+    // 成为 mirror slave 后模式表不再代表该屏自身，重扫时读取会得到虚拟屏的尺寸。
+    // 首次应用时记录，后续沿用。
+    if (_originalNative.width <= 0 || _originalNative.height <= 0) {
+        _originalNative = [BLDisplayInfo nativePixelSizeForDisplay:_physicalDisplayID];
+    }
+
     // 记下物理屏此刻的原生模式（首次应用时）。对齐刷新率会改它，还原时要换回来。
     if (!_savedPhysMode) {
         _savedPhysMode = CGDisplayCopyDisplayMode(_physicalDisplayID);
     }
 
-    // 先把物理屏切到与目标一致的刷新率。硬件镜像不会自动同步 slave 的刷新率，
-    // 不对齐就会 master 100Hz / slave 60Hz 各扫各的，表现为画面周期性抖动。
+    // 先将物理屏切换到目标刷新率。硬件镜像不同步 slave 的刷新率，
+    // 未对齐时 master 与 slave 各自刷新，画面周期性抖动。
     CGDisplayModeRef aligned = BLCopyAlignedMode(_physicalDisplayID, hz);
     if (aligned) {
         double exact = CGDisplayModeGetRefreshRate(aligned);
@@ -166,48 +364,18 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
         usleep(350 * 1000);
     }
 
-    CGVirtualDisplayDescriptor *d = [[CGVirtualDisplayDescriptor alloc] init];
-    d.name = @"HiDPI";
-    d.maxPixelsWide = MAX(8192u, wantW * 2 + 64);
-    d.maxPixelsHigh = MAX(8192u, wantH * 2 + 64);
-    d.sizeInMillimeters = CGDisplayScreenSize(_physicalDisplayID);
-    d.vendorID = 0x424C;                                    // 'BL'
-    d.productID = 0x0400 + (_physicalDisplayID & 0x00FF);    // 每块屏不同，避免 override 撞车
-    d.serialNum = _physicalDisplayID;
-    d.queue = dispatch_get_main_queue();
-
-    CGVirtualDisplay *vd = [[CGVirtualDisplay alloc] initWithDescriptor:d];
-    if (!vd) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:2
-                                            userInfo:@{NSLocalizedDescriptionKey: @"虚拟屏初始化返回 nil。"}];
-        return NO;
-    }
-
-    CGVirtualDisplaySettings *st = [[CGVirtualDisplaySettings alloc] init];
-    st.hiDPI = 1;
-    st.modes = @[[[CGVirtualDisplayMode alloc] initWithWidth:wantW height:wantH refreshRate:hz]];
-    if (![vd applySettings:st]) {
-        if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:3
-                                            userInfo:@{NSLocalizedDescriptionKey: @"applySettings 返回 NO。"}];
-        return NO;
-    }
+    CGVirtualDisplay *vd = BLMakeVirtualDisplay(_physicalDisplayID,
+                                               @[[NSValue valueWithSize:CGSizeMake(wantW, wantH)]],
+                                               hz, error);
+    if (!vd) return NO;
 
     _vd = vd;
     _virtualDisplayID = vd.displayID;
 
-    // 等它进 online 列表
-    for (int i = 0; i < 60; i++) {
-        uint32_t n = 0;
-        CGDirectDisplayID ids[32];
-        CGGetOnlineDisplayList(32, ids, &n);
-        BOOL found = NO;
-        for (uint32_t k = 0; k < n; k++) if (ids[k] == _virtualDisplayID) { found = YES; break; }
-        if (found && CGDisplayIsActive(_virtualDisplayID)) break;
-        usleep(50 * 1000);
-    }
+    BLWaitVirtualOnline(_virtualDisplayID, 60);
     usleep(500 * 1000);
 
-    // 自检：2× 背板是否真的存在
+    // 自检：2× 背板是否存在
     if (![self verifyHiDPIExpectWidth:wantW]) {
         if (error) *error = [NSError errorWithDomain:BLVDErrorDomain code:4
                                             userInfo:@{NSLocalizedDescriptionKey:
@@ -248,12 +416,9 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
 }
 
 - (BOOL)verifyHiDPIExpectWidth:(unsigned)wantW {
-    const char *exe = BLExecutablePath();
-    if (!exe) return YES;   // 拿不到自身路径就不阻断（极少见）
-
     for (int i = 0; i < 25; i++) {
         size_t pointW = 0, pixelW = 0;
-        if (BLProbeDisplay(exe, _virtualDisplayID, &pointW, &pixelW) && pointW > 0) {
+        if (BLProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW)) {
             return (pointW == (size_t)wantW) && (pixelW == (size_t)wantW * 2);
         }
         usleep(250 * 1000);
@@ -265,7 +430,7 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
 
 - (void)teardown {
     if (_active) {
-        // 必须用物理屏 ID：虚拟屏是主屏时 CGMainDisplayID() 会返回虚拟屏，解镜会解错对象
+        // 必须使用物理屏 ID：虚拟屏为主屏时 CGMainDisplayID() 返回虚拟屏，导致解镜对象错误
         CGDisplayConfigRef cfg = NULL;
         if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
             CGConfigureDisplayMirrorOfDisplay(cfg, _physicalDisplayID, kCGNullDirectDisplay);
@@ -278,7 +443,7 @@ static CGDisplayModeRef BLCopyAlignedMode(CGDirectDisplayID did, double wantHz) 
         _virtualDisplayID = 0;
     }
 
-    // 把物理屏刷新率换回对齐前的值，否则关掉虚拟屏后会停留在被改过的频率上
+    // 恢复对齐前的物理屏刷新率
     if (_savedPhysMode) {
         usleep(200 * 1000);
         CGDisplayConfigRef cfg = NULL;

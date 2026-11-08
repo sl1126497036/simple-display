@@ -28,9 +28,24 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly, copy) NSArray<NSNumber *> *refreshRates;
 /// 是否主屏
 @property (nonatomic, readonly) BOOL isMain;
+/// 内建屏（笔记本自带）。本身通常已是 2×，一般不需要再套虚拟屏
+@property (nonatomic, readonly) BOOL isBuiltin;
 
-/// 取不到则返回 nil（显示器可能刚被拔掉）
+#pragma mark - 原生像素尺寸
+
+/// 面板原生像素尺寸。
+///
+/// 判据：模式表中「点 == 像素」的模式里像素面积最大者。
+/// 不使用 `CGDisplayPixelsWide()`：它返回当前模式的像素宽，
+/// 系统缩放或其它 HiDPI 工具生效时并非原生值，会导致候选分辨率与刷新率筛选失配。
++ (CGSize)nativePixelSizeForDisplay:(CGDirectDisplayID)did;
+
+/// 取不到则返回 nil（显示器可能刚被拔掉）。
 + (nullable instancetype)infoWithDisplayID:(CGDirectDisplayID)did;
+
+/// @param override 非 CGSizeZero 时直接采用（该屏正被镜像、模式表已不代表它本身时用）
++ (nullable instancetype)infoWithDisplayID:(CGDirectDisplayID)did
+                          nativePixelSize:(CGSize)override;
 
 /// 默认点尺寸：原生像素的 0.75（3440 → 2580×1080）
 @property (nonatomic, readonly) CGSize defaultPointSize;

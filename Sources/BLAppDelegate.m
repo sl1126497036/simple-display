@@ -5,10 +5,63 @@
 #import "BLAppDelegate.h"
 #import "BLDisplayInfo.h"
 #import "BLVirtualScreen.h"
+#import "BLProbeCache.h"
 
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 extern BOOL gBLRequestSelfTest;   // 定义在 main.m
+
+/// 在后台探测某块屏的全部候选尺寸。
+///
+/// 走子进程而不是在本进程里建屏，有两个原因：
+///  1. 建屏为同步调用，单档 1~2 秒，置于主线程会阻塞菜单；
+///  2. 探测需反复建拆虚拟屏，置于子进程可隔离失败，不影响正在使用的屏。
+static void BLRunProbeAll(CGDirectDisplayID did,
+                          void (^onLine)(unsigned w, unsigned h, int result),
+                          void (^onDone)(void)) {
+    NSString *exePath = [NSBundle mainBundle].executablePath;
+    if (exePath.length == 0) { onDone(); return; }
+    const char *exe = exePath.fileSystemRepresentation;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int fds[2];
+        if (pipe(fds) != 0) { onDone(); return; }
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fds[0]);
+            dup2(fds[1], STDOUT_FILENO);
+            close(fds[1]);
+            char idbuf[24];
+            snprintf(idbuf, sizeof idbuf, "%u", did);
+            execl(exe, exe, "--probe-all", idbuf, "--no-cache", (char *)NULL);
+            _exit(127);
+        }
+        if (pid < 0) { close(fds[0]); close(fds[1]); onDone(); return; }
+
+        close(fds[1]);
+        FILE *f = fdopen(fds[0], "r");
+        if (f) {
+            char buf[256];
+            while (fgets(buf, sizeof buf, f)) {
+                unsigned w = 0, h = 0;
+                int r = -1;
+                if (sscanf(buf, "%u %u %d", &w, &h, &r) == 3) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ onLine(w, h, r); });
+                }
+            }
+            fclose(f);
+        } else {
+            close(fds[0]);
+        }
+
+        int status = 0;
+        waitpid(pid, &status, 0);
+        dispatch_async(dispatch_get_main_queue(), ^{ onDone(); });
+    });
+}
 
 /// 退出兜底：把所有处于镜像状态的屏解除镜像。
 /// 不依赖具体实例，避免对象已释放时漏还原。
@@ -50,6 +103,7 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSMutableDictionary<NSNumber *, NSValue *> *_prefSize;
     NSMutableDictionary<NSNumber *, NSNumber *> *_prefHz;
     BOOL _rebuilding;
+    BOOL _probing;
 }
 
 #pragma mark - 生命周期
@@ -122,7 +176,12 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 
     NSMutableArray<BLDisplayInfo *> *arr = [NSMutableArray array];
     for (NSNumber *num in alive) {
-        BLDisplayInfo *info = [BLDisplayInfo infoWithDisplayID:num.unsignedIntValue];
+        // 该屏正被本工具的虚拟屏镜像时，模式表不再代表其自身，
+        // 使用激活前记录的原生尺寸，避免菜单显示虚拟屏的尺寸。
+        BLVirtualScreen *vs = _screens[num];
+        CGSize override = vs.active ? vs.originalNativePixelSize : CGSizeZero;
+        BLDisplayInfo *info = [BLDisplayInfo infoWithDisplayID:num.unsignedIntValue
+                                              nativePixelSize:override];
         if (info) [arr addObject:info];
     }
     [arr sortUsingComparator:^NSComparisonResult(BLDisplayInfo *a, BLDisplayInfo *b) {
@@ -170,10 +229,16 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSError *err = nil;
     if (![vs applyPointSize:size refreshRate:hz error:&err]) {
         fprintf(stderr, "APPLY FAIL: %s\n", err.localizedDescription.UTF8String);
+        // code 4 = 没拿到 2× 背板。这是「这块屏 + 这个尺寸」的固有结论（换系统大版本前不会变），
+        // 记录后，该尺寸在菜单中显示为不可用。
+        if (err.code == 4) {
+            [[BLProbeCache shared] setResult:BLProbeResultDegraded forDisplay:physID size:size];
+        }
         [self showError:err.localizedDescription];
     } else {
         fprintf(stderr, "APPLY OK: %ux%u @%.2fHz\n",
                 (unsigned)size.width, (unsigned)size.height, vs.refreshRate);
+        [[BLProbeCache shared] setResult:BLProbeResultHiDPI forDisplay:physID size:size];
     }
     [self rebuildMenu];
 }
@@ -207,14 +272,15 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 }
 
 - (NSString *)statusText {
+    if (_probing) return @"正在检测可用尺寸…";
     NSArray *on = [self activeScreens];
-    if (on.count == 0) return @"未启用（物理屏原生）";
+    if (on.count == 0) return @"未启用";
     if (on.count == 1) {
         BLVirtualScreen *vs = on.firstObject;
-        return [NSString stringWithFormat:@"%u × %u  @ %.0fHz  HiDPI 2×",
+        return [NSString stringWithFormat:@"%u × %u  @ %.0fHz",
                 (unsigned)vs.pointSize.width, (unsigned)vs.pointSize.height, vs.refreshRate];
     }
-    return [NSString stringWithFormat:@"%lu 块屏已启用 HiDPI", (unsigned long)on.count];
+    return [NSString stringWithFormat:@"%lu 块屏已启用", (unsigned long)on.count];
 }
 
 - (NSString *)statusBarTitle {
@@ -234,6 +300,16 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSMenuItem *st = [[NSMenuItem alloc] initWithTitle:[self statusText] action:nil keyEquivalent:@""];
     st.enabled = NO;
     [menu addItem:st];
+
+    // 私有 API 缺失时在菜单中明确提示
+    if (![BLVirtualScreen isPrivateAPIAvailable]) {
+        NSMenuItem *warn = [[NSMenuItem alloc]
+                            initWithTitle:@"缺少 CGVirtualDisplay，无法使用"
+                                   action:nil keyEquivalent:@""];
+        warn.enabled = NO;
+        [menu addItem:warn];
+    }
+
     [menu addItem:[NSMenuItem separatorItem]];
 
     if (_displays.count == 0) {
@@ -283,6 +359,7 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSMenuItem *curItem = [[NSMenuItem alloc] initWithTitle:cur action:nil keyEquivalent:@""];
     curItem.enabled = NO;
     [m addItem:curItem];
+
     [m addItem:[NSMenuItem separatorItem]];
 
     // 分辨率
@@ -290,10 +367,16 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSMenu *resMenu = [[NSMenu alloc] init];
     for (NSValue *v in info.pointSizes) {
         CGSize s = v.sizeValue;
-        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:
-                          [NSString stringWithFormat:@"%u × %u", (unsigned)s.width, (unsigned)s.height]
-                                                    action:@selector(pickResolution:)
-                                             keyEquivalent:@""];
+        // 已知会降级的尺寸不列出：菜单只保留可用的档位
+        if ([[BLProbeCache shared] resultForDisplay:info.displayID size:s] == BLProbeResultDegraded) {
+            continue;
+        }
+
+        NSMenuItem *it = [[NSMenuItem alloc]
+                          initWithTitle:[NSString stringWithFormat:@"%u × %u",
+                                         (unsigned)s.width, (unsigned)s.height]
+                               action:@selector(pickResolution:)
+                        keyEquivalent:@""];
         it.representedObject = @{ @"did": @(info.displayID), @"size": v };
         it.target = self;
         if (on && (unsigned)vs.pointSize.width == (unsigned)s.width &&
@@ -301,6 +384,13 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
             it.state = NSControlStateValueOn;
         }
         [resMenu addItem:it];
+    }
+
+    if (resMenu.numberOfItems == 0) {
+        NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:@"无可列出的尺寸"
+                                                      action:nil keyEquivalent:@""];
+        none.enabled = NO;
+        [resMenu addItem:none];
     }
     resRoot.submenu = resMenu;
     [m addItem:resRoot];
@@ -322,6 +412,30 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     [m addItem:hzRoot];
 
     [m addItem:[NSMenuItem separatorItem]];
+
+    // 探测入口。该屏虚拟屏启用时不执行探测：探测需建屏，两者互相干扰。
+    BOOL probed = [[BLProbeCache shared] hasAnyResultForDisplay:info.displayID];
+    NSString *probeTitle = _probing ? @"正在检测…"
+                                    : (probed ? @"重新检测尺寸" : @"检测可用尺寸");
+
+    NSMenuItem *probe = [[NSMenuItem alloc] initWithTitle:probeTitle
+                                                   action:@selector(probeDisplayAction:)
+                                            keyEquivalent:@""];
+    probe.representedObject = @(info.displayID);
+    probe.target = self;
+    probe.enabled = (!on && !_probing);
+    [m addItem:probe];
+
+    // 清除检测记录后，被隐藏的尺寸会重新列出
+    NSMenuItem *forget = [[NSMenuItem alloc] initWithTitle:@"恢复全部尺寸"
+                                                    action:@selector(forgetProbeAction:)
+                                             keyEquivalent:@""];
+    forget.representedObject = @(info.displayID);
+    forget.target = self;
+    forget.enabled = probed && !_probing && !on;
+    [m addItem:forget];
+
+    [m addItem:[NSMenuItem separatorItem]];
     NSMenuItem *off = [[NSMenuItem alloc] initWithTitle:@"关闭本屏虚拟屏"
                                                  action:@selector(turnOffOneAction)
                                           keyEquivalent:@""];
@@ -334,6 +448,38 @@ static void BLReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
 }
 
 #pragma mark - Actions
+
+- (void)probeDisplayAction:(NSMenuItem *)item {
+    CGDirectDisplayID did = [item.representedObject unsignedIntValue];
+    if (_probing) return;
+
+    BLVirtualScreen *vs = _screens[@(did)];
+    if (vs.active) {
+        [self showError:@"请先关闭这块屏的虚拟屏，再开始检测。"];
+        return;
+    }
+
+    _probing = YES;
+    [self rebuildMenu];
+
+    __weak typeof(self) weakSelf = self;
+    BLRunProbeAll(did, ^(unsigned w, unsigned h, int result) {
+        [[BLProbeCache shared] setResult:(BLProbeResult)result
+                             forDisplay:did
+                                    size:CGSizeMake(w, h)];
+    }, ^{
+        __strong typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_probing = NO;
+        [self rebuildMenu];
+    });
+}
+
+- (void)forgetProbeAction:(NSMenuItem *)item {
+    CGDirectDisplayID did = [item.representedObject unsignedIntValue];
+    [[BLProbeCache shared] forgetDisplay:did];
+    [self rebuildMenu];
+}
 
 - (void)pickResolution:(NSMenuItem *)item {
     NSDictionary *d = item.representedObject;

@@ -1,143 +1,150 @@
 # BetterLite VD
 
-用 `CGVirtualDisplay` 造一块真 2× HiDPI 的虚拟显示器，再硬件镜像到物理屏 —— 绕过面板原生分辨率 / EDID 带宽 / `DisplayHints` 对 HiDPI 尺寸的限制。
+macOS 菜单栏工具。为外接显示器创建一块 2× 渲染的虚拟屏，再把该显示器硬件镜像上去，使 macOS 可获得面板原生分辨率之外的 HiDPI 尺寸。
 
-菜单栏常驻，多显示器、任意分辨率、任意刷新率都支持。
+装到 `/Applications/BetterLite VD.app`，或直接运行 `build/` 下的产物。运行后菜单栏出现 `HiDPI` 条目。
 
-## 为什么需要它
+## 术语
 
-物理屏原生 3440×1440 时，想用 5120×2160（2560×1080 点 @2×）这种超原生尺寸：
+| 术语 | 含义 |
+|---|---|
+| 点尺寸 | 系统 UI 使用的逻辑尺寸，菜单与命令行参数 `W H` 均指这个值 |
+| 背板像素 | 虚拟屏实际渲染的像素尺寸。2× HiDPI 下等于点尺寸的两倍 |
+| 硬件镜像 | 显示器作为 mirror slave 跟随虚拟屏输出，由 GPU 缩放到面板分辨率 |
+| 降级 | 系统对某些点尺寸不生成 2× 背板，按 1× 呈现，UI 会撑出屏幕 |
 
-- `scale-resolutions` 覆盖文件写不进去 —— 生成阶段就被 `DisplayHints.MaxW` 和 EDID 的 `MaxTotalPixelRate` 否掉
-- 虚拟屏没有物理时序限制，背板想多大就多大，再让 GPU 缩放到面板输出
-
-实测这块屏（PHL349X7，3440×1440@100Hz，M4）：
-
-| 请求点尺寸 | 背板 | 结果 |
-|---|---|---|
-| 2580×1080 | 5160×2160 | ✅ 2× |
-| 2560×1080 | 5120×2160 | ✅ 2× |
-| 3440×1440 | 6880×2880 | ✅ 2× |
-| 2064×864 | 4128×1728 | ❌ 降级 1×（已拦截） |
-
-## 用法
+## 安装
 
 ```bash
 ./build.sh
 open "build/BetterLite VD.app"
 ```
 
-或安装：
+安装到应用程序目录：
 
 ```bash
 ditto "build/BetterLite VD.app" "/Applications/BetterLite VD.app"
 ```
 
-命令行：
+首次运行若被 Gatekeeper 拦截，对 app 执行：
 
 ```bash
-BIN="build/BetterLite VD.app/Contents/MacOS/BetterLiteVD"
-"$BIN" --apply 2580 1080 100        # 主屏，点尺寸 2580×1080 @100Hz
-"$BIN" --apply 2580 1080 100 3      # 指定 displayID
-"$BIN" --selftest                   # 自动跑 建/拆/重建
+xattr -d com.apple.quarantine "/Applications/BetterLite VD.app"
 ```
 
-菜单结构：
+## 使用
+
+菜单栏 `HiDPI` 条目展开后，每块显示器一个子菜单：
 
 ```
-未启用（物理屏原生）
-────────────────────────
-石老板的PHL349X7 · 21:9 3440x1440 (主屏)  ▸
-    当前：2580 × 1080 @ 100Hz
-    ────────────────
-    分辨率  ▸  3440×1440 / 3268×1368 / … / 2580×1080 / … / 1280×536
-    刷新率  ▸  50.0 / 56.0 / 60.0 / 67.0 / 70.0 / 72.0 / 75.0 / 100.0
-    ────────────────
+2580 × 1080  @ 100Hz
+────────────
+显示器名 · 21:9 3440x1440 (主屏)  ▸
+    当前：2580 × 1080  @ 100Hz
+    分辨率  ▸  3440 × 1440 / … / 2580 × 1080 / …
+    刷新率  ▸  60.0 Hz / 100.0 Hz
+    检测可用尺寸
+    恢复全部尺寸
     关闭本屏虚拟屏
-────────────────────────
+────────────
 全部关闭
 重新扫描显示器
-────────────────────────
+────────────
 退出
 ```
 
-## 通用性设计
+选择分辨率或刷新率即重建虚拟屏并镜像。关闭、退出或进程终止时解除镜像并恢复物理屏原模式。
 
-不假设任何固定分辨率、刷新率或显示器数量。
+### 命令行
 
-| 维度 | 做法 |
-|---|---|
-| **多显示器** | 每块物理屏一个 `BLVirtualScreen` 实例，各自独立建屏 / 镜像 / 还原，互不干扰 |
-| **热插拔** | `CGDisplayRegisterReconfigurationCallback` → 主队列 `rescan`，自动清理已拔屏、重建菜单 |
-| **候选分辨率** | 两条来源合并去重：① 该屏模式表里已认可的点尺寸 ② 按该屏宽高比从 0.50~1.00 生成 |
-| **宽高比** | 逐屏计算，按 3% 容差归类（16:9 / 21:9 / 32:9 / 16:10 / 4:3 …），生成时严格保持本屏比例 |
-| **刷新率** | 遍历该屏模式表收集实际支持值（去重 ±0.6Hz），不硬编码 |
-| **刷新率对齐** | 镜像前先把物理屏切到目标刷新率模式，并用该模式的精确值建虚拟屏 —— 硬件镜像不会自己同步 slave |
-| **默认尺寸** | 面板像素 ×0.75（3440 → 2580×1080），即「21:9 的 1080」 |
+应用与还原：
 
-## 关键实现细节
-
-### HiDPI 必须从外部进程判定
-
-建虚拟屏的进程内读不到真实背板：
-
-- `CGDisplayCopyAllDisplayModes` → `NULL`（虚拟屏没有模式数据库）
-- `CGDisplayCopyDisplayMode` → `NULL`
-- `CGDisplayPixelsWide` → 首帧返回点宽、重建时返回 0
-
-所以自检改成 `fork()` + `execv(self, "--probe", displayID)`，子进程读 `CGDisplayCopyDisplayMode`，判据：
-
-```
-点宽 == 请求宽  &&  背板宽 == 2 × 请求宽
+```bash
+BIN="build/BetterLite VD.app/Contents/MacOS/BetterLiteVD"
+"$BIN" --apply 2580 1080 100      # 主屏，点尺寸 2580×1080 @100Hz
+"$BIN" --apply 2580 1080 100 3    # 指定 displayID
 ```
 
-不满足就立刻回滚，**绝不做镜像**，屏幕不会出现任何变化。
+自检：
 
-### 4× 背板不是全部尺寸都能拿到
+```bash
+"$BIN" --selftest                 # 建屏 → 还原 → 换刷新率重建 → 还原
+```
 
-部分点尺寸会被系统静默降级成 1×（`Resolution` 与 `UI Looks like` 数值相同，UI 撑出屏幕）。
-成因未定位 —— 已排除宽高奇偶、8 对齐、`sizeInMillimeters`(DPI)、`maxPixelsWide`。
-目前靠运行时自检兜住，降级即回滚并提示。
+诊断：
 
-### 镜像后物理屏 `active == 0` 是正常的
+```bash
+"$BIN" --diagnose                 # 输出显示器、原生像素、模式表统计、候选尺寸
+"$BIN" --diagnose --probe         # 附加：逐档检测哪些点尺寸能拿到 2×
+"$BIN" --probe-size 2580 1080 3   # 单档检测，输出 2x / 1x / fail
+"$BIN" --probe-all 3              # 全部候选逐档检测，结果写入缓存
+"$BIN" --probe 3                  # 输出某屏当前模式的 "点宽 背板宽"
+"$BIN" --modes 3                  # 输出某屏全部模式的 "点宽 点高 像素宽 像素高"
+```
 
-`Hardware Mirror` 的 slave 不独立驱动，`CGDisplayIsActive` 为 0 属正常态，不是黑屏。
-判断画面是否正常要看 `system_profiler` 的 `Mirror Status: Hardware Mirror`。
+## 适用范围
 
-### 解镜必须用保存的物理屏 ID
+适用：
 
-虚拟屏成为主屏后 `CGMainDisplayID()` 返回的是虚拟屏，用它解镜会解错对象。
-`BLVirtualScreen` 全程持有 `physicalDisplayID`。
+- 外接显示器在 macOS 上缺少所需 HiDPI 档位
+- 需要以低于面板原生的点尺寸获得 2× 渲染
+- 多显示器独立配置
 
-### 镜像调用会偶发返回 1001
+不适用：
 
-刚解除镜像的过渡态里 `CGConfigureDisplayMirrorOfDisplay` 必失败一次。
-先等 `CGDisplayIsActive(phys) && CGDisplayMirrorsDisplay(phys) == kCGNullDirectDisplay`，再重试（最多 5 次）。
+- 需要改变面板原生分辨率本身
+- 内建屏（通常已是 2×，叠加虚拟屏只增加一层合成）
+- 需要 HDR 或色彩配置随虚拟屏透传的场景
+
+## 工作原理
+
+1. `CGVirtualDisplay` 创建虚拟屏，申请 2× 背板
+2. 子进程读取该屏真实模式，确认「点宽 == 请求宽」且「背板宽 == 2 × 请求宽」
+3. 确认通过后，把物理屏镜像到虚拟屏；未通过则销毁虚拟屏，不改动显示状态
+
+系统在虚拟屏上不提供模式数据库，因此 2× 判定必须在创建虚拟屏的进程之外完成：
+
+| 调用 | 建屏进程内 | 子进程 |
+|---|---|---|
+| `CGDisplayCopyAllDisplayModes` | 返回 `NULL` | 返回完整模式表 |
+| `CGDisplayCopyDisplayMode` | 返回 `NULL` | 返回当前模式 |
+| `CGDisplayPixelsWide` | 首帧为点宽，重建时为 0 | 返回背板宽 |
+
+## 兼容性与限制
+
+- 依赖 `CGVirtualDisplay` 私有 API。系统移除该 API 时功能不可用，菜单会提示；程序启动时检查类与方法是否存在，不直接调用。
+- 部分点尺寸会被系统降级为 1×，边界随面板、GPU 与系统版本变化。建屏后自检失败即回滚，屏幕状态不变。菜单中的「检测可用尺寸」会逐档检测并把结果写入缓存，已知降级的档位不再列出；「恢复全部尺寸」清除该记录。
+- 缓存位于 `~/Library/Application Support/BetterLiteVD/probe-cache.plist`，按显示器 vendor、model 与面板原生像素区分。
+- 镜像时 master 与 slave 不会自动同步刷新率，程序在建屏前将物理屏切换到目标刷新率，并在关闭时恢复原模式。
+- 硬件镜像的 slave 不独立驱动，`CGDisplayIsActive` 返回 0 属正常状态，实际输出以系统报告的 `Hardware Mirror` 为准。
+- 部分尺寸组合下画面可能出现轻微周期性闪烁。更换分辨率档位可规避，成因尚未定位。
+
+## 故障排查
+
+```bash
+BIN="build/BetterLite VD.app/Contents/MacOS/BetterLiteVD"
+"$BIN" --diagnose --probe
+```
+
+输出包含 macOS 版本、私有 API 可用性、每块屏的原生像素、当前模式、模式表统计、刷新率列表、候选尺寸，以及各档尺寸的 2× 检测结果。
+
+残留虚拟屏或镜像未解除时，终止进程后恢复：
+
+```bash
+pkill -f BetterLiteVD
+```
 
 ## 文件
 
 ```
 betterlite-vd/
 ├── Sources/
-│   ├── main.m                     入口 / --probe / --apply / --selftest
+│   ├── main.m                     入口；--apply / --selftest / --diagnose / --probe / --modes / --probe-size / --probe-all
 │   ├── BLAppDelegate.h/.m         菜单栏、多屏调度、热插拔
-│   ├── BLDisplayInfo.h/.m         单屏信息、候选分辨率、刷新率推导
-│   ├── BLVirtualScreen.h/.m       单屏虚拟屏生命周期（建/自检/镜像/还原）
+│   ├── BLDisplayInfo.h/.m         单屏信息、原生像素推断、候选尺寸与刷新率
+│   ├── BLVirtualScreen.h/.m       虚拟屏生命周期：建屏 / 自检 / 镜像 / 还原
+│   ├── BLProbeCache.h/.m          各屏可用尺寸记录
 │   └── CGVirtualDisplayPrivate.h  私有 API 声明
 ├── Resources/Info.plist           LSUIElement（无 Dock 图标）
 └── build.sh
 ```
-
-## 安全性
-
-| 场景 | 行为 |
-|---|---|
-| 关闭虚拟屏 | 解除镜像，物理屏回原生模式 |
-| 退出 app | `applicationWillTerminate` + `atexit` 双重解除镜像 |
-| `kill -9` | 虚拟屏随进程销毁，系统自动把物理屏恢复成主屏 |
-| 尺寸不支持 | 建屏后自检失败即回滚，屏幕不变 |
-
-## 环境
-
-Apple Silicon + macOS 13+（实测 macOS 27.0.1 / M4 / 3440×1440@100Hz）。
-用的是 `CGVirtualDisplay` 私有 API，系统大版本升级后可能失效。
