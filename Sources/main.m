@@ -31,7 +31,6 @@
 
 BOOL gSDRequestSelfTest = NO;
 BOOL gSDRequestDumpMenu = NO;
-BOOL gSDRequestVolumeProbe = NO;
 
 #pragma mark - 诊断
 
@@ -229,7 +228,6 @@ int main(int argc, const char *argv[]) {
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--dump-menu") == 0) gSDRequestDumpMenu = YES;
-            if (strcmp(argv[i], "--volume-probe") == 0) gSDRequestVolumeProbe = YES;
         }
 
         if (argc >= 2 && strcmp(argv[1], "--volume") == 0) {

@@ -5,7 +5,6 @@
 #import "SDAppDelegate.h"
 #import "SDDisplayInfo.h"
 #import "SDDisplayDDC.h"
-#import "SDTrace.h"
 #import "SDVirtualScreen.h"
 #import "SDProbeCache.h"
 
@@ -17,7 +16,6 @@
 
 extern BOOL gSDRequestSelfTest;   // 定义在 main.m
 extern BOOL gSDRequestDumpMenu;   // 定义在 main.m
-extern BOOL gSDRequestVolumeProbe; // 定义在 main.m
 
 /// 在后台探测当前屏的全部候选尺寸。
 ///
@@ -113,6 +111,14 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     NSInteger _restoreRetries;    // 显示器尚未枚举时的重试次数
     NSString *_restoreFailure;    // 自动应用失败的原因，显示在状态行
 
+    CGSize   _lastGoodSize;       // 最近一次成功应用的点尺寸，唤醒后按它重建
+    double   _lastGoodHz;
+    CGDirectDisplayID _lastGoodPhysID;
+    BOOL     _wakeRecovering;     // 正在按记录配置恢复，失败不弹窗
+    BOOL     _wakeRecoveryPending; // 已排入一次唤醒自检，避免重复触发
+    BOOL     _rebuildOnWake;      // 经历过显示睡眠，唤醒后按记录值重建
+    NSInteger _wakeBuildRetries;  // 唤醒建屏失败后的重试次数
+
     SDDisplayDDC *_ddc;
     NSSlider    *_volumeSlider;
     NSTextField *_volumeLabel;
@@ -137,6 +143,17 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     _statusItem.button.toolTip = @"Simple Display";
 
     CGDisplayRegisterReconfigurationCallback(SDReconfigCallback, (__bridge void *)self);
+
+    // 显示器休眠会切断 DP 链路，唤醒后系统重建镜像关系，可能改掉虚拟屏的身份或时序。
+    // 唤醒与屏幕唤醒两个通知都收，靠标志去重。
+    NSNotificationCenter *wsnc = [NSWorkspace sharedWorkspace].notificationCenter;
+    [wsnc addObserver:self selector:@selector(screensDidSleep:)
+                 name:NSWorkspaceScreensDidSleepNotification object:nil];
+    [wsnc addObserver:self selector:@selector(screensDidWake:)
+                 name:NSWorkspaceScreensDidWakeNotification object:nil];
+    [wsnc addObserver:self selector:@selector(screensDidWake:)
+                 name:NSWorkspaceDidWakeNotification object:nil];
+
     atexit(SDRestoreAtExit);
 
     [self rescan];
@@ -156,56 +173,18 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
         if (did == kCGNullDirectDisplay) did = CGMainDisplayID();
         double hz = self.startupHz > 1.0 ? self.startupHz : [self preferredHz];
         [self applyToDisplay:did size:self.startupSize refreshRate:hz];
-    } else if (!gSDRequestSelfTest && !gSDRequestDumpMenu && !gSDRequestVolumeProbe) {
+    } else if (!gSDRequestSelfTest && !gSDRequestDumpMenu) {
         [self restoreLastConfiguration];
     }
 
     if (gSDRequestSelfTest) [self runSelfTest];
     if (gSDRequestDumpMenu) { [self dumpMenu]; exit(0); }
-    if (gSDRequestVolumeProbe) [self runVolumeProbe];
-}
-
-/// 在 app 进程内验证 DDC 写入是否真的到达显示器：写完后回读，两者不一致即说明写入未落地。
-- (void)runVolumeProbe {
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            __strong typeof(self) s = weakSelf;
-            if (!s) return;
-
-            NSError *err = nil;
-            if (![s->_ddc reloadVolume:&err]) {
-                SDTrace(@"probe initial read failed: %@", err.localizedDescription);
-                _exit(0);
-            }
-            unsigned base = s->_ddc.volume;
-            SDTrace(@"probe base=%u", base);
-
-            // 模拟一次拖动：每 60ms 更新落点，共 15 次，与真实拖动节奏一致
-            unsigned start = (base > 40) ? base - 30 : base + 15;
-            unsigned intended = start + 14;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                for (int i = 0; i < 15; i++) {
-                    [s scheduleVolumeWrite:(unsigned)(start + i)];
-                    usleep(60 * 1000);
-                }
-            });
-
-            sleep(2);
-            BOOL r = [s->_ddc reloadVolume:&err];
-            SDTrace(@"probe drag intended=%u readback=%u ok=%d", intended, s->_ddc.volume, r);
-
-            [s->_ddc setVolume:base error:NULL];
-            sleep(1);
-            _exit(0);
-        });
-    });
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
     [self turnOff];
     CGDisplayRemoveReconfigurationCallback(SDReconfigCallback, (__bridge void *)self);
+    [[NSWorkspace sharedWorkspace].notificationCenter removeObserver:self];
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app { return YES; }
@@ -243,6 +222,130 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
             [delegate rescan];
             // 目标屏晚于进程启动才枚举出时，在此补一次自动恢复。
             if (added) [delegate restoreLastConfiguration];
+        });
+    }
+}
+
+#pragma mark - 休眠与唤醒
+
+/// 把一次唤醒自检的结论写入偏好设置。
+static void SDRecordWakeCheck(NSString *verdict) {
+    [[NSUserDefaults standardUserDefaults] setObject:
+        [NSString stringWithFormat:@"%@ %@", [NSDate date], verdict]
+                                              forKey:@"SDLastWakeCheck"];
+}
+
+/// 唤醒后的状态时间线。登录界面的闪烁可能持续数秒，单次采样会漏掉中途的变化。
+static void SDAppendWakeTimeline(NSString *line) {
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *a = [[u arrayForKey:@"SDWakeTimeline"] mutableCopy];
+    if (!a) a = [NSMutableArray array];
+    [a addObject:[NSString stringWithFormat:@"%@ %@", [NSDate date], line]];
+    while (a.count > 8) [a removeObjectAtIndex:0];
+    [u setObject:a forKey:@"SDWakeTimeline"];
+}
+
+- (void)recordWakeState:(NSString *)tag {
+    SDAppendWakeTimeline([NSString stringWithFormat:@"%@ %@", tag,
+                          [_screen configurationDiagnostic]]);
+}
+
+- (void)screensDidSleep:(NSNotification *)note {
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"SDWakeTimeline"];
+    [self recordWakeState:@"sleep"];
+
+    // 睡眠期间不改显示配置：CGBeginDisplayConfiguration 会挂起，
+    // 直到唤醒才返回，屏幕可能停在半完成的配置上。
+    // 这里只做标记，建屏留到唤醒之后。
+    _rebuildOnWake = YES;
+}
+
+/// 显示器休眠会切断 DP 链路，唤醒后系统重新建立镜像，虚拟屏的身份、点尺寸或
+/// 镜像关系都可能被动过，画面表现为周期性闪烁。唤醒后按记录值重建一次。
+- (void)screensDidWake:(NSNotification *)note {
+    SDRecordWakeCheck([NSString stringWithFormat:@"wake: %@", [_screen configurationDiagnostic]]);
+    [self recordWakeState:@"t+0s"];
+    if (_wakeRecoveryPending) return;
+    _wakeRecoveryPending = YES;
+
+    __weak typeof(self) weakSelf = self;
+    // 唤醒后系统还要重建镜像关系，立即检查会读到过渡态，因此稍等再动手。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(self) s = weakSelf;
+        if (!s) return;
+        s->_wakeRecoveryPending = NO;
+        [s recoverAfterWake];
+    });
+
+    // 登录界面会停留一段时间，继续采样以覆盖途中可能发生的变化。
+    for (NSNumber *delay in @[@5, @10]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(self) s = weakSelf;
+            if (!s) return;
+            [s recordWakeState:[NSString stringWithFormat:@"t+%ds", delay.intValue]];
+        });
+    }
+}
+
+- (void)recoverAfterWake {
+    // 本次运行没有成功应用过配置时无从恢复，交给启动恢复处理。
+    if (_lastGoodSize.width < 320) return;
+
+    [self recordWakeState:@"wake+1.2s"];
+
+    // 唤醒后直接建屏，不等登录完成。此时屏幕上只有登录界面，重建表现为一次切换；
+    // 若等桌面排布完成再建，窗口会跟着整体重排，幅度比一次切换大得多。
+    _wakeBuildRetries = 0;
+    [self buildForCurrentSession];
+}
+
+/// 按记录值建屏。
+- (void)buildForCurrentSession {
+    if (_lastGoodSize.width < 320) return;
+
+    // 刚经历过显示睡眠：系统重建过显示管线，此时虚拟屏的时序已不可信，
+    // 即使自检通过也重建一次，重建本身就是恢复手段。
+    BOOL forced = _rebuildOnWake;
+    _rebuildOnWake = NO;
+
+    if (!forced && _screen.active && [_screen isConfigurationIntact]) {
+        SDRecordWakeCheck([NSString stringWithFormat:@"wake ok %ux%u@%.2f (%@)",
+                           (unsigned)_lastGoodSize.width, (unsigned)_lastGoodSize.height,
+                           _lastGoodHz, [_screen configurationDiagnostic]]);
+        return;
+    }
+
+    CGDirectDisplayID phys = _lastGoodPhysID ?: (_info ? _info.displayID : kCGNullDirectDisplay);
+    if (phys == kCGNullDirectDisplay) return;
+
+    SDRecordWakeCheck([NSString stringWithFormat:@"wake rebuild (%@) -> %ux%u@%.2f",
+                       [_screen configurationDiagnostic],
+                       (unsigned)_lastGoodSize.width, (unsigned)_lastGoodSize.height, _lastGoodHz]);
+
+    // 用记录值重建，不重新探测：唤醒路径上要的是回到原状态，不是重新选型。
+    NSTimeInterval buildStart = [NSDate timeIntervalSinceReferenceDate];
+
+    _wakeRecovering = YES;
+    [self applyToDisplay:phys size:_lastGoodSize refreshRate:_lastGoodHz];
+    _wakeRecovering = NO;
+
+    SDAppendWakeTimeline([NSString stringWithFormat:@"rebuilt cost=%.1fs active=%d",
+                          [NSDate timeIntervalSinceReferenceDate] - buildStart,
+                          _screen.active]);
+
+    // 唤醒后链路尚未就绪时建屏会失败，此时画面停在原生分辨率上。
+    // 隔一会儿再试，最多两次。
+    if (!_screen.active && _wakeBuildRetries < 2) {
+        _wakeBuildRetries++;
+        [self recordWakeState:@"rebuild-retry"];
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(self) s = weakSelf;
+            if (!s) return;
+            [s buildForCurrentSession];
         });
     }
 }
@@ -340,10 +443,11 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
         if (err.code == 4) {
             [[SDProbeCache shared] setResult:SDProbeResultDegraded forDisplay:physID size:size];
         }
-        if (_restoring) {
-            // 自动恢复期间失败不弹窗。
-            _restoreFailure = @"上次的尺寸无法应用，请手动选择";
-            [self forgetConfiguration];
+        if (_restoring || _wakeRecovering) {
+            // 自动恢复与唤醒恢复失败都不弹窗，只在状态行提示。
+            _restoreFailure = _wakeRecovering ? @"唤醒后恢复失败，请手动选择"
+                                              : @"上次的尺寸无法应用，请手动选择";
+            if (_restoring) [self forgetConfiguration];
         } else {
             [self showError:err.localizedDescription];
         }
@@ -352,7 +456,13 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
                 (unsigned)size.width, (unsigned)size.height, _screen.refreshRate);
         [[SDProbeCache shared] setResult:SDProbeResultHiDPI forDisplay:physID size:size];
         [self rememberConfigurationForDisplay:physID size:size hz:_screen.refreshRate];
+        _lastGoodSize = _screen.pointSize;
+        _lastGoodHz = _screen.refreshRate;
+        _lastGoodPhysID = physID;
         _restoreFailure = nil;
+        // 已经建好屏，本次唤醒不再重试。
+        _rebuildOnWake = NO;
+        _wakeBuildRetries = 0;
     }
     [self rescan];
 }
@@ -360,6 +470,9 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
 - (void)turnOff {
     [_screen teardown];
     _restoreFailure = nil;
+    // 用户主动关屏：不再自动建回来。
+    _rebuildOnWake = NO;
+    _wakeBuildRetries = 0;
     [self rescan];
 }
 
@@ -417,7 +530,6 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
             start = YES;
         }
     }
-    SDTrace(@"schedule target=%u start=%d", target, start);
     if (!start) return;
 
     __weak typeof(self) weakSelf = self;
@@ -429,9 +541,7 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
             unsigned want;
             @synchronized (self) { want = self->_pendingVolume; }
 
-            NSError *werr = nil;
-            BOOL wok = [self->_ddc setVolume:want error:&werr];
-            SDTrace(@"writer want=%u ok=%d err=%@", want, wok, werr.localizedDescription);
+            [self->_ddc setVolume:want error:NULL];
 
             BOOL settled = NO;
             @synchronized (self) {
@@ -456,7 +566,6 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
 
 - (void)volumeSliderChanged:(NSSlider *)slider {
     unsigned v = (unsigned)llround(slider.doubleValue);
-    SDTrace(@"sliderChanged v=%u", v);
     if (_volumeLabel) _volumeLabel.stringValue = [NSString stringWithFormat:@"%u", v];
     [self scheduleVolumeWrite:v];
 }
@@ -793,9 +902,8 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(self) s = weakSelf;
             if (!s) return;
-            // 有未落地的写入时不回填，否则会把刚拖到的位置拽回旧值
+            // 有未落地的写入时不回填：此时滑块值来自拖动，DDC 回读值已过期
             @synchronized (s) {
-                SDTrace(@"menuWillOpen fill v=%u writing=%d", s->_ddc.volume, s->_volumeWriting);
                 if (s->_volumeWriting) return;
                 unsigned v = s->_ddc.volume;
                 s->_volumeMuted = (v == 0);

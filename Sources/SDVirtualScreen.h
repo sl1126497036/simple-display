@@ -53,6 +53,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// 解除镜像并销毁虚拟屏（幂等）
 - (void)teardown;
 
+/// 当前配置是否仍与建屏时一致：虚拟屏在线、模式仍为记录的点尺寸 + 2× 背板、
+/// 物理屏仍镜像它。显示器休眠唤醒后系统会重建显示管线，任一项可能被改变。
+- (BOOL)isConfigurationIntact;
+
+/// 自检状态摘要，用于唤醒前后的对照记录。
+- (NSString *)configurationDiagnostic;
+
 @end
 
 NS_ASSUME_NONNULL_END

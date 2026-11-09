@@ -167,7 +167,7 @@ static CGVirtualDisplay *SDMakeVirtualDisplay(CGDirectDisplayID physID,
     if (!vd) {
         if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:2
                                             userInfo:@{NSLocalizedDescriptionKey:
-                          @"虚拟屏初始化返回 nil。可能是 maxPixels 超出本机渲染能力。"}];
+                          @"虚拟屏初始化返回 nil。"}];
         return nil;
     }
 
@@ -322,15 +322,15 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     }
 
     [self teardown];
-    usleep(300 * 1000);
+    usleep(150 * 1000);
 
     // 等物理屏从上次镜像里真正恢复（过渡态里立刻再镜像会返回 kCGErrorFailure / 1001）
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 25; i++) {
         if (CGDisplayIsActive(_physicalDisplayID) &&
             CGDisplayMirrorsDisplay(_physicalDisplayID) == kCGNullDirectDisplay) break;
-        usleep(100 * 1000);
+        usleep(80 * 1000);
     }
-    usleep(400 * 1000);
+    usleep(200 * 1000);
 
     // 记录被镜像前的原生像素尺寸。
     // 成为 mirror slave 后模式表不再代表该屏自身，重扫时读取会得到虚拟屏的尺寸。
@@ -360,7 +360,7 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
             }
         }
         CGDisplayModeRelease(aligned);
-        usleep(350 * 1000);
+        usleep(200 * 1000);
     }
 
     CGVirtualDisplay *vd = SDMakeVirtualDisplay(_physicalDisplayID,
@@ -371,9 +371,7 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
     _vd = vd;
     _virtualDisplayID = vd.displayID;
 
-    SDWaitVirtualOnline(_virtualDisplayID, 60);
-    usleep(500 * 1000);
-
+    // 注册上线与模式生效都是异步的，合并成一次等待：能读到期望的 2× 模式即视为就绪。
     // 自检：2× 背板是否存在
     if (![self verifyHiDPIExpectWidth:wantW]) {
         if (error) *error = [NSError errorWithDomain:SDVDErrorDomain code:4
@@ -415,14 +413,76 @@ static void SDWaitVirtualOnline(CGDirectDisplayID vid, int tries) {
 }
 
 - (BOOL)verifyHiDPIExpectWidth:(unsigned)wantW {
-    for (int i = 0; i < 25; i++) {
+    for (int i = 0; i < 40; i++) {
         size_t pointW = 0, pixelW = 0;
         if (SDProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW)) {
             return (pointW == (size_t)wantW) && (pixelW == (size_t)wantW * 2);
         }
-        usleep(250 * 1000);
+        usleep(80 * 1000);
     }
     return NO;
+}
+
+#pragma mark - 自检
+
+- (BOOL)isConfigurationIntact {
+    if (!_active || _virtualDisplayID == kCGNullDirectDisplay) return NO;
+
+    // 休眠期间系统可能把虚拟屏移出在线列表，唤醒时按新身份重新注册，
+    // 此时旧 displayID 已成为悬空引用。
+    uint32_t n = 0;
+    CGGetOnlineDisplayList(0, NULL, &n);
+    CGDirectDisplayID ids[16] = {0};
+    CGGetOnlineDisplayList(16, ids, &n);
+    BOOL online = NO;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == _virtualDisplayID) { online = YES; break; }
+    }
+    if (!online) return NO;
+
+    // 模式必须仍是记录的点尺寸，且背板为其两倍；掉回 1× 会让画面铺满而非 HiDPI。
+    size_t pointW = 0, pixelW = 0;
+    if (!SDProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW)) return NO;
+    if (pointW != (size_t)llround(_pointSize.width)) return NO;
+    if (pixelW != pointW * 2) return NO;
+
+    // 刷新率也必须仍是记录值；掉档会让 master 与 slave 按不同频率刷新。
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(_virtualDisplayID);
+    if (mode) {
+        double measured = CGDisplayModeGetRefreshRate(mode);
+        CGDisplayModeRelease(mode);
+        if (measured > 1.0 && _refreshRate > 1.0 && fabs(measured - _refreshRate) > 0.6) return NO;
+    }
+
+    // 物理屏必须仍镜像这块虚拟屏，否则它按自身模式输出，与虚拟屏不同步。
+    if (CGDisplayMirrorsDisplay(_physicalDisplayID) != _virtualDisplayID) return NO;
+    return YES;
+}
+
+- (NSString *)configurationDiagnostic {
+    size_t pointW = 0, pixelW = 0;
+    BOOL gotMode = SDProbeCurrentMode(_virtualDisplayID, &pointW, &pixelW);
+
+    uint32_t n = 0;
+    CGGetOnlineDisplayList(0, NULL, &n);
+    CGDirectDisplayID ids[16] = {0};
+    CGGetOnlineDisplayList(16, ids, &n);
+    BOOL online = NO;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == _virtualDisplayID) { online = YES; break; }
+    }
+
+    // 刷新率给出「实测/记录」两个值，便于区分是模式本身变了还是记录过期。
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(_virtualDisplayID);
+    double measuredHz = mode ? CGDisplayModeGetRefreshRate(mode) : 0;
+    if (mode) CGDisplayModeRelease(mode);
+
+    return [NSString stringWithFormat:
+            @"active=%d vid=%u online=%d pt=%zu px=%zu hz=%.2f/%.2f mirror=%u intact=%d",
+            _active, _virtualDisplayID, online,
+            gotMode ? pointW : 0, gotMode ? pixelW : 0,
+            measuredHz, _refreshRate, CGDisplayMirrorsDisplay(_physicalDisplayID),
+            [self isConfigurationIntact]];
 }
 
 #pragma mark - 还原

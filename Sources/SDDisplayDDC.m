@@ -3,7 +3,6 @@
 //
 
 #import "SDDisplayDDC.h"
-#import "SDTrace.h"
 
 #import <dlfcn.h>
 #import <IOKit/IOKitLib.h>
@@ -81,7 +80,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     io_iterator_t iter = 0;
     if (IOServiceGetMatchingServices(kIOMainPortDefault,
                                      IOServiceMatching("DCPAVServiceProxy"), &iter) != KERN_SUCCESS) {
-        SDTrace(@"openChannel -> iterator failed");
         return NO;
     }
 
@@ -94,8 +92,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
         IORegistryEntryGetRegistryEntryID(candidate, &eid);
         CFTypeRef loc = IORegistryEntryCreateCFProperty(candidate, CFSTR("Location"),
                                                         kCFAllocatorDefault, 0);
-        SDTrace(@"candidate #%d eid=%llu location=%@", index, eid,
-                loc ? (__bridge NSString *)loc : @"?");
         if (loc) CFRelease(loc);
 
         if (index == 0) {
@@ -113,7 +109,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
         IOObjectRelease(service);
     }
 
-    SDTrace(@"openChannel -> candidates=%d svc=%p", index, _service);
     return _service != NULL;
 }
 
@@ -144,7 +139,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     uint8_t request[2] = { kSDOpGetVCP, vcp };
     IOReturn rq = _write(_service, kSDDDCChipAddress, kSDDDCDataAddress, request, sizeof request);
     if (rq != kIOReturnSuccess) {
-        SDTrace(@"read req vcp=0x%02x ioret=0x%x svc=%p", vcp, (unsigned)rq, _service);
         return NO;
     }
 
@@ -154,14 +148,10 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     uint8_t reply[11] = { 0 };
     IOReturn rr = _read(_service, kSDDDCChipAddress, kSDDDCDataAddress, reply, sizeof reply);
     if (rr != kIOReturnSuccess) {
-        SDTrace(@"read rsp vcp=0x%02x ioret=0x%x", vcp, (unsigned)rr);
         return NO;
     }
 
     // 6E 88 02 <result> <vcp> <type> <maxH> <maxL> <curH> <curL> <chk>
-    SDTrace(@"read rsp vcp=0x%02x bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-            vcp, reply[0], reply[1], reply[2], reply[3], reply[4], reply[5],
-            reply[6], reply[7], reply[8], reply[9], reply[10]);
 
     if (reply[2] != 0x02 || reply[3] != 0x00 || reply[4] != vcp) return NO;
 
@@ -181,7 +171,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
 
 - (BOOL)writeVCPOnce:(uint8_t)vcp value:(uint16_t)value {
     if (!_service) {
-        SDTrace(@"write vcp=0x%02x val=%u -> no service", vcp, value);
         return NO;
     }
 
@@ -192,7 +181,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
         (uint8_t)(value & 0xFF),
     };
     IOReturn r = _write(_service, kSDDDCChipAddress, kSDDDCDataAddress, request, sizeof request);
-    SDTrace(@"write vcp=0x%02x val=%u ioret=0x%x svc=%p", vcp, value, (unsigned)r, _service);
     if (r != kIOReturnSuccess) {
         return NO;
     }
@@ -202,8 +190,7 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     // 显示器对 SET 也会返回一条消息。不读走它，命令缓冲会一直被占用，
     // 后续 SET 将被静默丢弃（写入仍返回成功）。这里只做读空，不校验内容。
     uint8_t reply[11] = { 0 };
-    IOReturn rr = _read(_service, kSDDDCChipAddress, kSDDDCDataAddress, reply, sizeof reply);
-    SDTrace(@"write drain ioret=0x%x", (unsigned)rr);
+    (void)_read(_service, kSDDDCChipAddress, kSDDDCDataAddress, reply, sizeof reply);
 
     return YES;
 }
@@ -239,7 +226,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     }
     [_lock unlock];
 
-    SDTrace(@"reload ok=%d cur=%u max=%u", ok, _volume, _maximum);
 
     if (!ok && error) {
         *error = SDDDCError(2, @"显示器未响应音量查询。");
@@ -260,7 +246,6 @@ static NSError *SDDDCError(NSInteger code, NSString *reason) {
     if (ok) _volume = volume;
     [_lock unlock];
 
-    SDTrace(@"setVolume want=%u ok=%d cached=%u", volume, ok, _volume);
 
     if (!ok && error) {
         *error = SDDDCError(3, @"写入音量失败。");

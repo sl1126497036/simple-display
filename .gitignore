@@ -4,3 +4,4 @@ build/
 *.xcuserstate
 .idea/
 .workbuddy/
+.opensource-review.json
