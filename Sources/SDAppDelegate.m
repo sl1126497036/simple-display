@@ -5,6 +5,7 @@
 #import "SDAppDelegate.h"
 #import "SDDisplayInfo.h"
 #import "SDDisplayDDC.h"
+#import "SDTrace.h"
 #import "SDVirtualScreen.h"
 #import "SDProbeCache.h"
 
@@ -16,6 +17,7 @@
 
 extern BOOL gSDRequestSelfTest;   // 定义在 main.m
 extern BOOL gSDRequestDumpMenu;   // 定义在 main.m
+extern BOOL gSDRequestVolumeProbe; // 定义在 main.m
 
 /// 在后台探测当前屏的全部候选尺寸。
 ///
@@ -154,12 +156,51 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
         if (did == kCGNullDirectDisplay) did = CGMainDisplayID();
         double hz = self.startupHz > 1.0 ? self.startupHz : [self preferredHz];
         [self applyToDisplay:did size:self.startupSize refreshRate:hz];
-    } else if (!gSDRequestSelfTest && !gSDRequestDumpMenu) {
+    } else if (!gSDRequestSelfTest && !gSDRequestDumpMenu && !gSDRequestVolumeProbe) {
         [self restoreLastConfiguration];
     }
 
     if (gSDRequestSelfTest) [self runSelfTest];
     if (gSDRequestDumpMenu) { [self dumpMenu]; exit(0); }
+    if (gSDRequestVolumeProbe) [self runVolumeProbe];
+}
+
+/// 在 app 进程内验证 DDC 写入是否真的到达显示器：写完后回读，两者不一致即说明写入未落地。
+- (void)runVolumeProbe {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            __strong typeof(self) s = weakSelf;
+            if (!s) return;
+
+            NSError *err = nil;
+            if (![s->_ddc reloadVolume:&err]) {
+                SDTrace(@"probe initial read failed: %@", err.localizedDescription);
+                _exit(0);
+            }
+            unsigned base = s->_ddc.volume;
+            SDTrace(@"probe base=%u", base);
+
+            // 模拟一次拖动：每 60ms 更新落点，共 15 次，与真实拖动节奏一致
+            unsigned start = (base > 40) ? base - 30 : base + 15;
+            unsigned intended = start + 14;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (int i = 0; i < 15; i++) {
+                    [s scheduleVolumeWrite:(unsigned)(start + i)];
+                    usleep(60 * 1000);
+                }
+            });
+
+            sleep(2);
+            BOOL r = [s->_ddc reloadVolume:&err];
+            SDTrace(@"probe drag intended=%u readback=%u ok=%d", intended, s->_ddc.volume, r);
+
+            [s->_ddc setVolume:base error:NULL];
+            sleep(1);
+            _exit(0);
+        });
+    });
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
@@ -188,6 +229,8 @@ static void SDReconfigCallback(CGDirectDisplayID did, CGDisplayChangeSummaryFlag
     _info = [SDDisplayInfo infoWithDisplayID:did nativePixelSize:override];
 
     _rebuilding = NO;
+    // 重配后旧的 DDC 通道会失效，丢弃让下次读写重新枚举
+    [_ddc refreshChannel];
     [self rebuildMenu];
 }
 
@@ -357,59 +400,82 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
     [self rebuildMenu];
 }
 
-/// 连续拖动只保留最后落点写入，中间的拖动值不逐个下发。
+/// 拖动期间只保留最新落点：写队列空闲时立即下发，写入进行中到达的落点不逐个下发，
+/// 待本次写入结束后取最新值继续。
+///
+/// 完成标志在写队列内复位，回显另走主队列；回显执行时机不影响后续写入。
 - (void)scheduleVolumeWrite:(unsigned)target {
     unsigned max = _ddc.maximum ? _ddc.maximum : 100;
     if (target > max) target = max;
 
+    BOOL start = NO;
     @synchronized (self) {
         _pendingVolume = target;
         _volumeMuted = (target == 0);
+        if (!_volumeWriting) {
+            _volumeWriting = YES;
+            start = YES;
+        }
     }
-
-    if (_volumeWriting) return;
-    _volumeWriting = YES;
+    SDTrace(@"schedule target=%u start=%d", target, start);
+    if (!start) return;
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(_volumeQueue, ^{
         __strong typeof(self) self = weakSelf;
         if (!self) return;
-        while (1) {
+
+        for (;;) {
             unsigned want;
             @synchronized (self) { want = self->_pendingVolume; }
-            [self->_ddc setVolume:want error:NULL];
-            unsigned now;
-            @synchronized (self) { now = self->_pendingVolume; }
-            if (now == want) break;
+
+            NSError *werr = nil;
+            BOOL wok = [self->_ddc setVolume:want error:&werr];
+            SDTrace(@"writer want=%u ok=%d err=%@", want, wok, werr.localizedDescription);
+
+            BOOL settled = NO;
+            @synchronized (self) {
+                if (self->_pendingVolume == want) {
+                    self->_volumeWriting = NO;
+                    settled = YES;
+                }
+            }
+            if (settled) break;
         }
+
+        unsigned landed;
+        @synchronized (self) { landed = self->_pendingVolume; }
+        // 回显走主队列，执行时机不影响写入结果
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(self) s = weakSelf;
-            if (s) s->_volumeWriting = NO;
+            if (!s || !s->_volumeLabel) return;
+            s->_volumeLabel.stringValue = [NSString stringWithFormat:@"%u", landed];
         });
     });
 }
 
 - (void)volumeSliderChanged:(NSSlider *)slider {
     unsigned v = (unsigned)llround(slider.doubleValue);
+    SDTrace(@"sliderChanged v=%u", v);
     if (_volumeLabel) _volumeLabel.stringValue = [NSString stringWithFormat:@"%u", v];
     [self scheduleVolumeWrite:v];
 }
 
 - (void)toggleMute:(NSMenuItem *)item {
+    // 静音状态由 scheduleVolumeWrite 依落点同步维护，这里只决定目标值
+    unsigned fallback = _ddc.maximum ? (_ddc.maximum / 2) : 50;
+    unsigned target;
     if (_volumeMuted) {
-        unsigned restore = _volumeSavedBeforeMute ?: (_ddc.maximum / 2);
-        [self scheduleVolumeWrite:restore];
+        target = _volumeSavedBeforeMute ?: fallback;
     } else {
-        _volumeSavedBeforeMute = _ddc.volume;
-        [self scheduleVolumeWrite:0];
+        _volumeSavedBeforeMute = _ddc.volume ?: fallback;
+        target = 0;
     }
+
+    [self scheduleVolumeWrite:target];
     // DDC 写入是异步的，先按预期刷新界面
-    _volumeMuted = !_volumeMuted;
-    if (_volumeSlider) _volumeSlider.doubleValue = _volumeMuted ? 0 : _volumeSavedBeforeMute;
-    if (_volumeLabel) {
-        _volumeLabel.stringValue = _volumeMuted ? @"0"
-                                                : [NSString stringWithFormat:@"%u", _volumeSavedBeforeMute];
-    }
+    if (_volumeSlider) _volumeSlider.doubleValue = target;
+    if (_volumeLabel) _volumeLabel.stringValue = [NSString stringWithFormat:@"%u", target];
 }
 
 #pragma mark - 开机启动
@@ -718,16 +784,25 @@ static NSString *const kSDLastHz         = @"SDLastRefreshRate";
     if (!_ddc.isAvailable) return;
 
     // 读 DDC 约 100ms，置于后台，避免菜单阻塞
+    __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSError *err = nil;
-        BOOL ok = [self->_ddc reloadVolume:&err];
-        if (!ok) return;
+        __strong typeof(self) reader = weakSelf;
+        if (!reader) return;
+        if (![reader->_ddc reloadVolume:NULL]) return;
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            unsigned v = self->_ddc.volume;
-            self->_volumeMuted = (v == 0);
-            self->_volumeSlider.maxValue = self->_ddc.maximum ? self->_ddc.maximum : 100;
-            self->_volumeSlider.doubleValue = v;
-            self->_volumeLabel.stringValue = [NSString stringWithFormat:@"%u", v];
+            __strong typeof(self) s = weakSelf;
+            if (!s) return;
+            // 有未落地的写入时不回填，否则会把刚拖到的位置拽回旧值
+            @synchronized (s) {
+                SDTrace(@"menuWillOpen fill v=%u writing=%d", s->_ddc.volume, s->_volumeWriting);
+                if (s->_volumeWriting) return;
+                unsigned v = s->_ddc.volume;
+                s->_volumeMuted = (v == 0);
+                s->_volumeSlider.maxValue = s->_ddc.maximum ? s->_ddc.maximum : 100;
+                s->_volumeSlider.doubleValue = v;
+                s->_volumeLabel.stringValue = [NSString stringWithFormat:@"%u", v];
+            }
         });
     });
 }

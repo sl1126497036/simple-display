@@ -26,6 +26,11 @@ extern NSString * const SDDDCErrorDomain;
 /// 设置音量，取值会被夹到 [minimum, maximum]。
 - (BOOL)setVolume:(unsigned)volume error:(NSError **)error;
 
+/// 丢弃当前通道，下次读写时重新枚举。
+/// 显示配置变化（虚拟屏建立、镜像切换、模式变更）后应调用，
+/// 否则旧通道会静默失效。
+- (void)refreshChannel;
+
 @end
 
 NS_ASSUME_NONNULL_END
